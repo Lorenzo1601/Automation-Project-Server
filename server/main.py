@@ -29,7 +29,7 @@ from server.config import Settings
 from server.db.audit import AuditService
 from server.db.base import Database
 from server.db.models import Project, User
-from common.filekinds import L5K, L5X, detect_kind, l5k_controller_name, media_type
+from common.filekinds import L5K, L5X, detect_kind, l5k_controller_name, media_type, rev_filename
 from server.merger import L5XError, Resolution, parse_l5x
 from server.notifier import Notifier
 from server.projects import ProjectRegistry, ProjectRuntime
@@ -129,8 +129,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except L5XError as exc:
             raise HTTPException(422, str(exc))
         rev = c.rt.store.commit(data, c.access.principal.username, "Revisione iniziale", filename=file.filename or "")
-        rec(c, "master_initialized", f"rev{rev.revision}", sha256=rev.sha256, kind=rev.kind, ext=rev.ext,
+        rec(c, "master_initialized", f"rev{rev.revision}", sha256=rev.sha256, kind=rev.kind, ext=rev.ext, name=rev.name,
             filename=(file.filename or "")[:120], **({"controller": controller} if controller else {}))
+        return c.rt.mgr.master_info()
+
+    @app.post(P + "/master/reimport", response_model=MasterInfo, tags=["master"])
+    async def reimport_master(file: UploadFile = File(...), reason: str = Form(...), c: Ctx = Depends(ctx(Role.LEAD))):
+        """Reimporta il file base su un progetto in corso (nuova revisione; richieste aperte rianalizzate)."""
+        if not c.rt.store.initialized:
+            raise HTTPException(409, "Master non inizializzato: usa il caricamento iniziale")
+        data = await file.read()
+        if len(data) > cfg.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, "File troppo grande")
+        await run_in_threadpool(c.rt.mgr.reimport, c.dev, data, file.filename or "", reason)
         return c.rt.mgr.master_info()
 
     @app.get(P + "/master", response_model=MasterInfo, tags=["master"])
@@ -154,7 +165,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         rec(c, "master_downloaded", f"rev{rev}", sha256=sha)
         st = c.rt.store
         return Response(data, media_type=media_type(st.kind), headers={
-            "Content-Disposition": f'attachment; filename="{c.access.slug}_rev{rev}{st.ext}"',
+            "Content-Disposition": f'attachment; filename="{rev_filename(st.name, rev, st.ext)}"',
             "X-Revision": str(rev), "X-SHA256": sha, "X-File-Ext": st.ext, "X-File-Kind": st.kind})
 
     @app.post(P + "/master/restore", response_model=MasterInfo, tags=["master"])
@@ -193,7 +204,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         p = c.rt.mgr.get(prop)
         rec(c, "preview_downloaded", prop)
         return Response(p.result.merged_xml, media_type=media_type(c.rt.store.kind), headers={
-            "Content-Disposition": f'attachment; filename="Preview_{prop}{c.rt.store.ext}"'})
+            "Content-Disposition": f'attachment; filename="{c.rt.store.name}_anteprima{c.rt.store.ext}"'})
 
     @app.post(P + "/proposals/{prop}/resolutions", response_model=ProposalDetail, tags=["merge"])
     def resolve(prop: str, body: ResolutionsIn, c: Ctx = Depends(ctx(Role.DEVELOPER))):

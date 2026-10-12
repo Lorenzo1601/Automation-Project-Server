@@ -5,12 +5,13 @@ estensione, oppure, su richiesta, tutti i file della cartella."""
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from common.filekinds import L5K, L5X, detect_kind
+from common.filekinds import L5K, L5X, detect_kind, rev_filename
 
 DEFAULT_EXT = ".L5X"
 MASTER_COPY = "Master" + DEFAULT_EXT              # copia del Master al momento del checkout (riferimento 'pulito')
@@ -84,25 +85,54 @@ def looks_like_kind(path: Path, kind: str) -> bool:
     return head is not None and detect_kind(head) == kind
 
 
+REF_DIR = ".aps"          # copie 'pulite' dei Master scaricati (cartella nascosta): riferimento per capire cosa hai modificato
+
+
+def ref_path(folder: "str | Path", name: str, revision: int, ext: str) -> Path:
+    """Dove sta la copia pulita della revisione ``revision``: ``<cartella>/.aps/<nome>_revN<ext>``."""
+    return Path(folder) / REF_DIR / rev_filename(name, revision, norm_ext(ext))
+
+
+def hide_ref_dir(folder: "str | Path") -> None:
+    """Su Windows nasconde la cartella ``.aps`` (altrove il punto iniziale basta)."""
+    d = Path(folder) / REF_DIR
+    try:
+        if os.name == "nt" and d.is_dir():
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(d), 0x2)          # FILE_ATTRIBUTE_HIDDEN
+    except Exception:                                                        # noqa: BLE001 - solo estetica
+        pass
+
+
 def find_merge_candidates(folder: "str | Path", working_file: str = "", max_depth: int = 2, ext: str = DEFAULT_EXT,
-                          kind: str = L5X, all_files: bool = False) -> list[Candidate]:
+                          kind: str = L5X, all_files: bool = False, name: str = "", base_rev: int = 0) -> list[Candidate]:
     """Elenca i file della cartella (e sottocartelle fino a ``max_depth``) che possono essere inviati al merge.
 
     Di norma sono i file con la stessa estensione del Master (``ext``: ``.L5X``, ``.L5K``, ...); con ``all_files`` si
-    elencano tutti i file. Esclude la copia ``Master<ext>`` e i ``Master_revN.*`` scaricati (non sono lavoro
-    dell'utente) e i file temporanei. Ordine: piu' recenti per primi. ``modified``/``unchanged`` si calcolano rispetto
-    alla copia del Master.
+    elencano tutti i file. Non elenca i file temporanei ne' le copie del Master scaricate e mai toccate
+    (``<name>_revN<ext>`` identiche alla copia pulita in ``.aps``), salvo il file del checkout. Ordine: piu' recenti
+    per primi. ``modified``/``unchanged`` si calcolano rispetto alla copia pulita della revisione del file (o, se non
+    c'e', della revisione base ``base_rev``).
+
+    Senza ``name`` (progetti creati con le versioni precedenti) il riferimento e' la vecchia ``Master<ext>`` e le
+    ``Master_revN`` sono escluse.
     """
     root = Path(folder)
     ext = norm_ext(ext)
     if not root.is_dir():
         return []
-    master_name = master_copy_name(ext)
-    master = root / master_name
-    m_mtime = master.stat().st_mtime if master.is_file() else None
-    m_size = master.stat().st_size if master.is_file() else None
+    legacy_name = master_copy_name(ext)
+    legacy = root / legacy_name
+    view_re = re.compile(rf"^{re.escape(name)}_rev(\d+){re.escape(ext)}$", re.I) if name else None
     wf = Path(working_file).resolve() if working_file else None
     out: list[Candidate] = []
+    refs: dict[int, Optional[Path]] = {}
+
+    def ref_for(rev: int) -> Optional[Path]:
+        if rev not in refs:
+            p = ref_path(root, name, rev, ext) if name and rev > 0 else None
+            refs[rev] = p if p is not None and p.is_file() else None
+        return refs[rev]
 
     def walk(d: Path, depth: int) -> None:
         try:
@@ -116,8 +146,9 @@ def find_merge_candidates(folder: "str | Path", working_file: str = "", max_dept
                 continue
             n = p.name
             if (not all_files and p.suffix.lower() != ext.lower()) or n.startswith(("~", ".")) \
-                    or n.lower().endswith((".tmp", ".bak", ".lock")) or n.lower() == master_name.lower() \
-                    or n.lower() == MASTER_COPY.lower() or _MASTER_VIEW.match(n):
+                    or n.lower().endswith((".tmp", ".bak", ".lock")):
+                continue
+            if not name and (n.lower() in (legacy_name.lower(), MASTER_COPY.lower()) or _MASTER_VIEW.match(n)):
                 continue
             try:
                 st = p.stat()
@@ -127,20 +158,38 @@ def find_merge_candidates(folder: "str | Path", working_file: str = "", max_dept
     walk(root, 0)
 
     cache: dict = {}
+
+    def sha_of(path: Path) -> str:
+        k = str(path)
+        if k not in cache:
+            cache[k] = _sha(path)
+        return cache[k]
+
+    kept: list[Candidate] = []
     for c in out:
         c.looks_ok = looks_like_kind(c.path, kind)
-        if m_mtime is not None:
-            c.modified = c.mtime > m_mtime + 2.0
-            if c.size == m_size:                                     # l'hash costa: solo se le dimensioni coincidono
-                if "m" not in cache:
-                    cache["m"] = _sha(master)
-                c.unchanged = _sha(c.path) == cache["m"]
+        ref: Optional[Path] = None
+        if view_re is not None:
+            m = view_re.match(c.name)
+            ref = ref_for(int(m.group(1))) if m else None
+            if ref is None:
+                ref = ref_for(base_rev)
+        elif legacy.is_file():
+            ref = legacy
+        if ref is None:
+            c.modified = True
+        else:
+            r = ref.stat()
+            c.modified = c.mtime > r.st_mtime + 2.0
+            if c.size == r.st_size:                                  # l'hash costa: solo se le dimensioni coincidono
+                c.unchanged = sha_of(c.path) == sha_of(ref)
                 if c.unchanged:
                     c.modified = False
-        else:
-            c.modified = True
-    out.sort(key=lambda c: c.mtime, reverse=True)
-    return out
+        if view_re is not None and view_re.match(c.name) and c.unchanged and not c.is_working:
+            continue                                                 # copia del Master scaricata e mai toccata
+        kept.append(c)
+    kept.sort(key=lambda c: c.mtime, reverse=True)
+    return kept
 
 
 def pick_default(cands: list[Candidate]) -> Optional[Candidate]:

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
 from client.api_client import ApiClient, ApiError
 from client.theme.tokens import T
 from client.theme.widgets import Avatar, icon, role_color
+from client.views.project_dialogs import NewProjectDialog                  # noqa: F401 - riesportato
 from client.views.common import chip, full_time, h_line, heading, item, make_table, muted, role_chip, role_label
 from client.workers import run_async
 from common.filekinds import import_filters
@@ -142,35 +143,6 @@ class UserDialog(QDialog):
             is_active=self.active.isChecked() if self.active.isChecked() != u.is_active else None,
             new_password=pw or None,
             must_change_password=self.must_change.isChecked() if pw else None)
-
-
-class NewProjectDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setWindowTitle("Nuovo progetto")
-        self.setMinimumWidth(440)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(22, 20, 22, 18)
-        lay.addWidget(heading("Nuovo progetto PLC", 2))
-        form = QFormLayout()
-        self.name = QLineEdit()
-        self.name.setPlaceholderText("Linea Imbottigliamento")
-        self.desc = QLineEdit()
-        self.lead = QCheckBox("Richiedi il Consenso Finale di un Lead per i merge dei Developer")
-        self.lead.setChecked(True)
-        form.addRow("Nome", self.name)
-        form.addRow("Descrizione", self.desc)
-        lay.addLayout(form)
-        lay.addWidget(self.lead)
-        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Save).setProperty("variant", "primary")
-        bb.accepted.connect(lambda: self.accept() if self.name.text().strip() else None)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    def payload(self) -> ProjectCreate:
-        return ProjectCreate(name=self.name.text().strip(), description=self.desc.text().strip(),
-                             require_lead_approval=self.lead.isChecked())
 
 
 # ======================================================================================= vista
@@ -314,9 +286,14 @@ class UserMgmtView(QWidget):
         self.btn_new_proj.setIcon(icon("plus", T["TEXT"], 18))
         self.btn_init = QPushButton("  Carica Master iniziale...")
         self.btn_init.setIcon(icon("upload", T["TEXT"], 18))
+        self.btn_reimport = QPushButton("  Reimporta file base...")
+        self.btn_reimport.setIcon(icon("refresh", T["TEXT"], 18))
+        self.btn_reimport.setToolTip("Sostituisce il Master di un progetto in lavorazione con un nuovo file base "
+                                     "(nuova revisione, cronologia intatta)")
         bar.addWidget(self.proj_combo)
         bar.addWidget(self.btn_new_proj)
         bar.addWidget(self.btn_init)
+        bar.addWidget(self.btn_reimport)
         bar.addStretch(1)
         l.addLayout(bar)
         opts = QHBoxLayout()
@@ -341,6 +318,7 @@ class UserMgmtView(QWidget):
         self.proj_combo.activated.connect(lambda _i: self._load_perms())
         self.btn_new_proj.clicked.connect(self.new_project)
         self.btn_init.clicked.connect(self.init_master)
+        self.btn_reimport.clicked.connect(self.reimport_master)
         self.chk_lead.clicked.connect(self._toggle_lead)
         self.btn_archive.clicked.connect(self.archive_project)
 
@@ -364,7 +342,7 @@ class UserMgmtView(QWidget):
     def _load_perms(self) -> None:
         p = self.current_project()
         has = p is not None
-        for wdg in (self.chk_lead, self.btn_archive, self.btn_init):
+        for wdg in (self.chk_lead, self.btn_archive, self.btn_init, self.btn_reimport):
             wdg.setEnabled(has)
         if p is None:
             self.perm_table.setRowCount(0)
@@ -373,6 +351,7 @@ class UserMgmtView(QWidget):
         self.chk_lead.setChecked(p.require_lead_approval)
         self.btn_archive.setText("Ripristina" if p.archived else "Archivia")
         self.btn_init.setVisible(p.head_revision is None)
+        self.btn_reimport.setVisible(p.head_revision is not None)
         self.proj_info.setText(f"Master rev {p.head_revision}" if p.head_revision is not None
                                else "Master non inizializzato")
         self._run(lambda: self.api.permissions(p.id), self._fill_perms, self._err)
@@ -453,6 +432,42 @@ class UserMgmtView(QWidget):
             self.projects_changed.emit()
             self.reload()
         self._run(lambda: self.api.init_master_for(p.id, Path(path)), ok, self._err)
+
+    def reimport_master(self, path: Optional[str] = None, reason: Optional[str] = None) -> None:
+        """Progetto in lavorazione: nuova revisione del Master da un file base aggiornato (storico intatto).
+
+        ``path`` e ``reason`` servono ai test (e a chi vuole saltare le domande): se mancano vengono chiesti.
+        """
+        p = self.current_project()
+        if p is None or p.head_revision is None:
+            return
+        ask = not isinstance(path, str)
+        if ask:
+            path, _ = QFileDialog.getOpenFileName(self, f"Nuovo file base di «{p.name}»", "", import_filters())
+        if not path:
+            return
+        if ask and QMessageBox.question(
+                self, "Reimporta file base",
+                f"Dal file «{Path(path).name}» verrà creata una NUOVA revisione del Master di «{p.name}».\n\n"
+                "• la cronologia resta intatta (si può sempre tornare alle revisioni precedenti);\n"
+                "• le richieste di merge in corso vengono rianalizzate sul nuovo Master e i consensi già dati "
+                "vengono azzerati;\n• i client vengono avvisati del nuovo Master.\n\nProcedere?") != QMessageBox.Yes:
+            return
+        if not isinstance(reason, str):
+            reason, ok_ = QInputDialog.getMultiLineText(
+                self, "Reimporta file base", "Motivo della reimportazione (minimo 5 caratteri):")
+            if not ok_:
+                return
+        reason = reason.strip()
+        if len(reason) < 5:
+            QMessageBox.warning(self, "Motivo troppo breve", "Indica un motivo di almeno 5 caratteri.")
+            return
+
+        def ok(m) -> None:
+            self.status.emit(f"File base reimportato in «{p.name}»: nuova rev {m.revision}")
+            self.projects_changed.emit()
+            self.reload()
+        self._run(lambda: self.api.reimport_master_for(p.id, Path(path), reason), ok, self._err)
 
     def _toggle_lead(self) -> None:
         p = self.current_project()

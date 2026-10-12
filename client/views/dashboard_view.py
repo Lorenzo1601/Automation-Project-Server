@@ -168,6 +168,8 @@ class DashboardView(QWidget):
     checkout_requested = Signal()
     merge_requested = Signal()
     history_requested = Signal()
+    import_master_requested = Signal()
+    reimport_master_requested = Signal()
     refresh_requested = Signal()
     folder_change_requested = Signal()
     folder_open_requested = Signal()
@@ -178,6 +180,8 @@ class DashboardView(QWidget):
         self._me = ""
         self._role = Role.VIEWER
         self._only_active = True
+        self._project_on = False                         # un progetto e' selezionato
+        self._master_init: Optional[bool] = None         # Master inizializzato? (None = non noto)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 20)
@@ -221,11 +225,21 @@ class DashboardView(QWidget):
         self.btn_merge.setIcon(icon("upload", T["TEXT_ON_ACCENT"], 18))
         self.btn_history = QPushButton("  Storico")
         self.btn_history.setIcon(icon("history", T["TEXT"], 18))
+        self.btn_import = QPushButton("  Importa file base...")
+        self.btn_import.setProperty("variant", "primary")
+        self.btn_import.setIcon(icon("upload", T["TEXT_ON_ACCENT"], 18))
+        self.btn_import.setToolTip("Il Master non e' ancora inizializzato: carica il file base del progetto "
+                                   "(L5K, L5X o qualsiasi altro file)")
+        self.btn_reimport = QPushButton("  Reimporta file base...")
+        self.btn_reimport.setProperty("variant", "warning")
+        self.btn_reimport.setIcon(icon("refresh", T["TEXT"], 18))
+        self.btn_reimport.setToolTip("Crea una nuova revisione del Master da un file base aggiornato "
+                                     "(la cronologia resta intatta)")
         self.btn_refresh = QPushButton()
         self.btn_refresh.setIcon(icon("refresh", T["TEXT"], 18))
         self.btn_refresh.setToolTip("Aggiorna")
         self.btn_refresh.setProperty("variant", "ghost")
-        for b in (self.btn_checkout, self.btn_merge, self.btn_history):
+        for b in (self.btn_checkout, self.btn_merge, self.btn_history, self.btn_import, self.btn_reimport):
             bar.addWidget(b)
         bar.addWidget(self.btn_refresh)
         bar.addStretch(1)
@@ -276,6 +290,8 @@ class DashboardView(QWidget):
         self.btn_checkout.clicked.connect(self.checkout_requested)
         self.btn_merge.clicked.connect(self.merge_requested)
         self.btn_history.clicked.connect(self.history_requested)
+        self.btn_import.clicked.connect(self.import_master_requested)
+        self.btn_reimport.clicked.connect(self.reimport_master_requested)
         self.btn_refresh.clicked.connect(self.refresh_requested)
         self.btn_folder.clicked.connect(self.folder_change_requested)
         self.btn_open_folder.clicked.connect(self.folder_open_requested)
@@ -290,12 +306,25 @@ class DashboardView(QWidget):
         self._me, self._role = session_key, role
         self.btn_merge.setVisible(role >= Role.DEVELOPER)
         self.btn_checkout.setText("  Checkout ultimo Master" if role >= Role.DEVELOPER else "  Scarica ultimo Master")
+        self._update_master_buttons()
         self._rebuild()
 
     def set_enabled_project(self, on: bool) -> None:
         for b in (self.btn_checkout, self.btn_merge, self.btn_history, self.btn_refresh, self.btn_folder,
                   self.btn_open_folder):
             b.setEnabled(on)
+        self._project_on = on
+        self._update_master_buttons()
+
+    def set_master_state(self, initialized: Optional[bool]) -> None:
+        """Master inizializzato o no: decide quale tra «Importa» e «Reimporta file base» e' disponibile (solo Lead/Admin)."""
+        self._master_init = initialized
+        self._update_master_buttons()
+
+    def _update_master_buttons(self) -> None:
+        can = self._project_on and self._role >= Role.LEAD and self._master_init is not None
+        self.btn_import.setVisible(bool(can and not self._master_init))
+        self.btn_reimport.setVisible(bool(can and self._master_init))
 
     def set_master(self, project_name: str, m: Optional[MasterInfo]) -> None:
         self.title.setText(project_name or "Merge & Consenso")

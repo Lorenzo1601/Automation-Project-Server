@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QToolButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from client.theme.tokens import T
 from client.theme.widgets import Avatar, StatusLed, icon, logo_pixmap, role_color
@@ -17,10 +17,67 @@ CLIENT_NAV = (("dashboard", "dashboard", "Merge & Consenso"), ("audit", "audit",
               ("users", "users", "Utenti & Permessi"))
 
 
+class NavButton(QToolButton):
+    """Voce di menu: icona e testo allineati sempre a sinistra (un QToolButton centra il gruppo icona+testo, per cui
+    voci con testo di lunghezza diversa risultano sfalsate)."""
+
+    ICON_SIZE = 20
+
+    def __init__(self, ico: str, text: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._ico, self._text = ico, text
+        self.setCheckable(True)
+        self.setFixedHeight(42)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setCursor(Qt.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(17, 0, 14, 0)          # 3 px del bordo attivo + 14 px di padding, uguali per tutte le voci
+        row.setSpacing(12)
+        self._icon = QLabel()
+        self._icon.setFixedSize(self.ICON_SIZE, self.ICON_SIZE)
+        self._label = QLabel(text)
+        self._label.setObjectName("NavText")
+        self._label.setTextFormat(Qt.PlainText)
+        for w in (self._icon, self._label):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+        row.addWidget(self._icon)
+        row.addWidget(self._label, 1)
+        self._hover = False
+        self.toggled.connect(lambda _on: self._refresh())
+        self._refresh()
+
+    def enterEvent(self, ev) -> None:                  # noqa: N802
+        self._hover = True
+        self._refresh()
+        super().enterEvent(ev)
+
+    def leaveEvent(self, ev) -> None:                  # noqa: N802
+        self._hover = False
+        self._refresh()
+        super().leaveEvent(ev)
+
+    def _refresh(self) -> None:
+        color = T["ACCENT"] if self.isChecked() else (T["TEXT"] if self._hover else T["MUTED"])
+        self._label.setStyleSheet(f"color:{color}; font-weight:500; background:transparent;")
+        self._refresh_icon()
+
+    def sizeHint(self) -> QSize:                       # noqa: D102
+        return QSize(200, 42)
+
+    def text(self) -> str:                             # noqa: D102 - il testo e' disegnato dall'etichetta interna
+        return self._text
+
+    def _refresh_icon(self) -> None:
+        pm = icon(self._ico, T["ACCENT"] if self.isChecked() else T["MUTED"], self.ICON_SIZE).pixmap(
+            QSize(self.ICON_SIZE, self.ICON_SIZE))
+        self._icon.setPixmap(pm)
+
+
 class Sidebar(QFrame):
     """Barra laterale. Per il client usa le voci di default; la GUI del server passa le proprie (``nav``)."""
     nav_changed = Signal(str)            # chiave della voce selezionata
     project_changed = Signal(int)
+    new_project_requested = Signal()     # pulsante «+» accanto al progetto (visibile solo all'Admin)
     logout_requested = Signal()
     password_requested = Signal()
 
@@ -62,7 +119,15 @@ class Sidebar(QFrame):
         self.project.setContentsMargins(0, 0, 0, 0)
         wrap = QHBoxLayout()
         wrap.setContentsMargins(14, 4, 14, 0)
-        wrap.addWidget(self.project)
+        wrap.setSpacing(6)
+        wrap.addWidget(self.project, 1)
+        self.btn_new_project = QToolButton()
+        self.btn_new_project.setIcon(icon("plus", T["ACCENT"], 18))
+        self.btn_new_project.setToolTip("Nuovo progetto...")
+        self.btn_new_project.setCursor(Qt.PointingHandCursor)
+        self.btn_new_project.setVisible(False)
+        self.btn_new_project.clicked.connect(self.new_project_requested)
+        wrap.addWidget(self.btn_new_project)
         lay.addLayout(wrap)
         self._project_widgets.append(self.project)
         self.project.activated.connect(lambda _i: self.project_changed.emit(self.project.currentData()))
@@ -72,29 +137,14 @@ class Sidebar(QFrame):
 
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
-        self.buttons: dict[str, QToolButton] = {}
+        self.buttons: dict[str, NavButton] = {}
         for key, ico, text in nav:
-            b = QToolButton()
-            b.setCheckable(True)
-            b.setText("  " + text.replace("&", "&&"))
-            b.setIcon(icon(ico, T["MUTED"], 20))
-            b.setIconSize(QSize(20, 20))
-            b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-            b.setSizePolicy(b.sizePolicy().horizontalPolicy(), b.sizePolicy().verticalPolicy())
-            b.setMinimumHeight(42)
-            b.setCursor(Qt.PointingHandCursor)
-            b.toggled.connect(lambda on, bt=b, i=ico: bt.setIcon(icon(i, T["ACCENT"] if on else T["MUTED"], 20)))
+            b = NavButton(ico, text)
             b.clicked.connect(lambda _c, k=key: self.nav_changed.emit(k))
             self.group.addButton(b)
             self.buttons[key] = b
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.addWidget(b)
-            lay.addLayout(row)
-            b.setMaximumWidth(16777215)
+            lay.addWidget(b)
         self.buttons[nav[0][0]].setChecked(True)
-        for b in self.buttons.values():
-            b.setStyleSheet("text-align:left;")
         lay.addStretch(1)
 
         # stato server
@@ -163,6 +213,9 @@ class Sidebar(QFrame):
         for k in self.admin_only:
             if k in self.buttons:
                 self.buttons[k].setVisible(u.role == "Admin")
+
+    def set_can_create_project(self, on: bool) -> None:
+        self.btn_new_project.setVisible(on)
 
     def set_projects(self, projects: list[ProjectOut], current: Optional[int]) -> None:
         self.project.blockSignals(True)

@@ -2,7 +2,7 @@
 
 Collaborazione multi-utente **offline** sui progetti PLC (oggi: file `.L5X` di Studio 5000; il nome è generico per
 poter aggiungere altri ambienti, es. CODESYS), con **3-way merge strutturale**, **consenso
-esplicito** prima di toccare `Master.L5X`, **utenti e ruoli** (modello Siemens Project Server) e **audit trail
+esplicito** prima di toccare il Master, **utenti e ruoli** (modello Siemens Project Server) e **audit trail
 immutabile**. Client desktop PySide6 con tema scuro industriale.
 
 ```
@@ -49,7 +49,7 @@ client/gui_approval.py     schermata Consenso + Diff + Conflitti      client/gui
 run_server.py / run_client.py   entry point per PyInstaller (run_server.py = exe unico del server: GUI, servizio, CLI)
 server/launcher.py         smista gli argomenti dell'exe unico: GUI | install/start/stop/... | serve | --run-service    build_server.bat / build_client.bat   creano gli exe
 client/api_client.py       client HTTP con refresh automatico del token   client/ws_listener.py  push
-tests/                     134 test (merger, tipi di file,  consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
+tests/                     168 test (merger, tipi di file, nomi file, reimport, consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
 samples/                   L5X di esempio: base, DevA, DevB (con e senza conflitti)
 ```
 
@@ -146,8 +146,11 @@ dell'app grafica e il servizio insieme sulla stessa porta.
 
 Nella schermata principale del client la riga **Cartella locale** indica dove il progetto e' salvato sul tuo PC; con
 *Cambia cartella...* la scegli tu, per ogni progetto (e per ogni server/utente). Al **primo Checkout** il client te la
-chiede. Il Checkout vi salva `Lavoro_revN.L5X` e `Master.L5X` (copia pulita del Master). **Richiedi Merge...** elenca i `.L5X`
-trovati in quella cartella (e sottocartelle, fino a 2 livelli), esclude `Master.L5X` e i `Master_revN.L5X`, ordina per data e
+chiede. I file portano **il nome del file con cui e' stato importato il Master** e, al massimo, il numero di revisione in
+fondo: importando `Linea1.L5K` il Checkout salva `Linea1_rev3.L5K` (e' il file su cui lavori), piu' una copia pulita nella
+cartella nascosta `.aps` (serve a capire cosa hai modificato). Se rifai il Checkout della stessa revisione e il file ha tue
+modifiche, **non viene sovrascritto**. **Richiedi Merge...** elenca i file con la stessa estensione trovati in quella
+cartella (e sottocartelle, fino a 2 livelli), non propone le copie del Master scaricate e mai toccate, ordina per data e
 preseleziona il piu' recente tra quelli modificati dopo il checkout; per ciascun file indica se e' *Modificato*, *Identico al
 Master* o *Non sembra un file L5X*. Con *Altro file...* si puo' scegliere un file anche fuori dalla cartella.
 
@@ -155,8 +158,8 @@ Master* o *Non sembra un file L5X*. Con *Altro file...* si puo' scegliere un fil
 
 Il Master puo' essere **qualsiasi file**: nelle finestre di selezione (Master iniziale, «Altro file...», salvataggi) c'e' sempre
 il filtro **Tutti i file (\*)**, e per Rockwell **L5K** (export ASCII) e **L5X** (export XML). L'estensione del primo file
-caricato resta quella del progetto: i file scaricati (`Lavoro_revN.L5K`, `Master.L5K`, `Master_revN.L5K`...) e quelli
-cercati da *Richiedi Merge* usano la stessa estensione; con **Mostra tutti i file** si elenca qualsiasi file della cartella.
+caricato resta quella del progetto: i file scaricati (`<nome>_revN.L5K`) e quelli
+cercati da *Richiedi Merge* usano la stessa estensione e lo stesso nome; con **Mostra tutti i file** si elenca qualsiasi file della cartella.
 
 | Tipo (riconosciuto dal contenuto) | Merge |
 |---|---|
@@ -166,6 +169,32 @@ cercati da *Richiedi Merge* usano la stessa estensione; con **Mostra tutti i fil
 | file binario | nessun merge: il Master e' versionato, scaricabile e ripristinabile, le richieste di merge sono rifiutate |
 
 Il tipo del file inviato deve coincidere con quello del Master (un L5X in un progetto L5K viene rifiutato).
+
+## Progetti e file base dal client
+
+Anche dal client (non solo dal server) si gestiscono i progetti e il file base (Master):
+
+* **Nuovo progetto** (pulsante **+** accanto all'elenco progetti, solo **Admin**: e' il ruolo che il server richiede per
+  creare progetti). Subito dopo il client propone di importare il file base.
+* **Importa file base...** (sulla schermata principale, per **Lead** e **Admin**, finche' il Master non e' inizializzato).
+  Il selettore file mostra *Tutti i file* in testa; Rockwell L5K / L5X a portata di mano.
+* **Reimporta file base...** (Lead e Admin, su un progetto gia' in lavorazione): carica un nuovo file base come **nuova
+  revisione** (la cronologia resta intatta, si puo' sempre tornare indietro dallo Storico). Chiede un motivo (minimo 5
+  caratteri) e finisce nella cronologia eventi (`master_reimported`). Deve essere dello stesso tipo del Master e, per
+  L5X/L5K, dello stesso controller, e diverso dal Master corrente. Le richieste di merge in sospeso vengono rianalizzate e i
+  consensi gia' dati si azzerano; il nome del file importato diventa il nuovo nome dei file distribuiti ai client.
+  Attenzione: il reimport **non passa dal consenso** degli altri sviluppatori, per questo e' riservato a Lead e Admin e
+  tracciato nell'audit.
+* **Dal server**: stessa funzione nell'interfaccia del server, pagina **Utenti & Progetti**, tab *Permessi di progetto*: scegli il progetto e premi **Reimporta file base...** (visibile se il Master e' gia' inizializzato; altrimenti c'e' *Carica Master iniziale*). Stessi controlli, stesso motivo obbligatorio e stesso evento `master_reimported`; i client collegati ricevono l'avviso di nuovo Master. Funziona anche con il server installato come servizio.
+
+### Reimport automatico dopo il tuo merge
+
+Quando una tua richiesta di merge viene completata, il client controlla cosa ha trovato il server sul Master rispetto alla
+revisione da cui eri partito. **Solo se ci sono modifiche di altri che tu non avevi** (non contano quelle identiche alle tue)
+scarica da solo il nuovo Master come tua nuova copia di lavoro (`<nome>_revN.<ext>`, nuova revisione base) e te lo
+**segnala**: riga nel registro, messaggio in barra di stato/area di notifica e una finestra non bloccante con il numero di
+modifiche altrui trovate e le unita' toccate. Il file precedente resta invariato su disco; un file con modifiche non
+unite non viene mai sovrascritto. Se il merge non porta modifiche altrui non succede nulla.
 
 ## Avvio da sorgente (Windows / PowerShell)
 
@@ -219,7 +248,7 @@ Test: `python -m pytest tests -q` (la GUI gira in modalità `offscreen`, nessun 
 
 ## Flusso di consenso
 
-1. Il Developer fa **Checkout** (scarica `Lavoro_revN.L5X`, la rev N diventa la sua base), modifica offline in Studio 5000.
+1. Il Developer fa **Checkout** (scarica `<nome del file importato>_revN.<ext>`, la rev N diventa la sua base), modifica offline in Studio 5000.
 2. **Richiedi Merge**: il server calcola il 3-way merge (Base = rev del checkout, Proposta = suo file, Master = ultima rev).
 3. Hanno diritto di voto l'autore e i Developer/Lead **attivi** (WebSocket o heartbeat entro `APS_SESSION_TTL`); i Viewer no.
    I partecipanti ricevono la notifica e si apre la schermata di consenso.
@@ -229,8 +258,8 @@ Test: `python -m pytest tests -q` (la GUI gira in modalità `offscreen`, nessun 
 6. Ottenuti tutti i consensi, il Master avanza di revisione e tutti scaricano la nuova versione. Ogni consenso è legato al
    *digest del risultato*: se cambia il Master o le risoluzioni, i consensi si azzerano.
 
-Il client non sovrascrive mai la copia di lavoro: dopo un aggiornamento scarica `Master.L5X` / `Master_revN.L5X` nella
-cartella del progetto e l'utente rifà il Checkout quando vuole.
+Il client non sovrascrive mai la copia di lavoro: dopo un aggiornamento scarica `<nome>_revN.<ext>` nella
+cartella del progetto (e la copia pulita in `.aps`) e l'utente rifà il Checkout quando vuole.
 
 ## API principali
 
@@ -247,6 +276,7 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
 | `POST /api/projects/{id}/master/init` | Lead |
 | `GET /api/projects/{id}/master` · `/master/history` · `/master/download` | Viewer |
 | `POST /api/projects/{id}/master/restore` | Admin |
+| `POST /api/projects/{id}/master/reimport` (file + motivo) | Lead / Admin |
 | `POST /heartbeat`, `GET /developers`, `GET /proposals[/{pid}[/preview]]` | Viewer |
 | `POST /proposals` | Developer |
 | `POST /proposals/{pid}/resolutions` · `/approve` · `/reject` · `/cancel` | Developer (regole di consenso sopra) |

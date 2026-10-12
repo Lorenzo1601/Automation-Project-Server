@@ -62,9 +62,9 @@ class ProjectRegistry:
         st = self.runtime(project_id).store
         return st.head().revision if st.initialized else None
 
-    def master_format(self, project_id: int) -> tuple[Optional[str], Optional[str]]:
+    def master_format(self, project_id: int) -> tuple[Optional[str], Optional[str], Optional[str]]:
         st = self.runtime(project_id).store
-        return (st.kind, st.ext) if st.initialized else (None, None)
+        return (st.kind, st.ext, st.name) if st.initialized else (None, None, None)
 
 
 def _slugify(name: str) -> str:
@@ -77,12 +77,12 @@ def build_router() -> APIRouter:
 
     def out(request: Request, s, proj: Project, role: Optional[Role], new: bool = False) -> ProjectOut:   # noqa: ANN001
         reg = request.app.state.registry
-        kind, ext = (None, None) if new else reg.master_format(proj.id)
+        kind, ext, mname = (None, None, None) if new else reg.master_format(proj.id)
         return ProjectOut(id=proj.id, slug=proj.slug, name=proj.name, description=proj.description,
                           require_lead_approval=proj.require_lead_approval, archived=proj.archived,
                           my_role=role.key if role else None,
                           head_revision=None if new else reg.head_revision(proj.id),
-                          master_kind=kind, master_ext=ext)
+                          master_kind=kind, master_ext=ext, master_name=mname)
 
     @r.get("", response_model=list[ProjectOut])
     def list_projects(request: Request, p: Principal = Depends(min_role(Role.VIEWER))):

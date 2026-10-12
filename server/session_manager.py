@@ -23,6 +23,7 @@ e vengono eseguiti dal threadpool di FastAPI.
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
@@ -34,9 +35,9 @@ from common.roles import Role
 from common.schemas import (ACTIVE_STATES, STATE_LABELS, ChangeOut, ConflictOut, DeveloperOut,
                             Event, MasterInfo, ParticipantOut, ProposalDetail, ProposalState,
                             ProposalSummary)
-from common.filekinds import KIND_LABELS, MERGEABLE, detect_kind
+from common.filekinds import KIND_LABELS, L5K, L5X, MERGEABLE, canonical_ext, detect_kind, l5k_controller_name
 from server.textmerge import merge_any
-from server.merger import L5XError, MergeResult, Resolution
+from server.merger import L5XError, MergeResult, Resolution, parse_l5x
 from server.notifier import EventSink, NullSink
 from server.storage import MasterStore, Revision
 
@@ -372,6 +373,55 @@ class SessionManager:
             self._after_master_advance(rev.revision, skip=None)
             return rev
 
+    def reimport(self, dev: Developer, data: bytes, filename: str, reason: str):
+        """Reimporta il file base (Master) su un progetto gia' avviato come NUOVA revisione (storico intatto).
+
+        Le richieste in corso vengono rianalizzate sul nuovo Master e i loro consensi azzerati.
+        """
+        with self._lock:
+            if dev.role < Role.LEAD:
+                raise SessionError(403, "Solo un Lead Engineer o un Project Administrator puo' reimportare il Master")
+            if not self.store.initialized:
+                raise SessionError(409, "Master non inizializzato: usa il caricamento iniziale")
+            reason = (reason or "").strip()
+            if len(reason) < 5:
+                raise SessionError(422, "Indica il motivo della reimportazione (almeno 5 caratteri)")
+            if not data:
+                raise SessionError(422, "Il file e' vuoto")
+            head = self.store.head()
+            got = detect_kind(data)
+            if got != head.kind:
+                raise SessionError(422, f"Il file e' di tipo «{KIND_LABELS[got]}» ma il Master del progetto e' "
+                                        f"«{KIND_LABELS[head.kind]}» ({head.ext})")
+            try:
+                if got == L5X:
+                    new_ctrl = parse_l5x(data).find("Controller").get("Name")
+                    old_ctrl = parse_l5x(self.store.read_revision(head.revision)).find("Controller").get("Name")
+                elif got == L5K:
+                    new_ctrl = l5k_controller_name(data)
+                    old_ctrl = l5k_controller_name(self.store.read_revision(head.revision))
+                else:
+                    new_ctrl = old_ctrl = ""
+            except L5XError as exc:
+                raise SessionError(422, str(exc)) from exc
+            if got in (L5X, L5K) and new_ctrl != old_ctrl:
+                raise SessionError(422, f"Il file contiene il Controller «{new_ctrl}» ma il progetto e' «{old_ctrl}»: "
+                                        f"un Controller diverso e' un altro progetto")
+            if got not in (L5X, L5K) and canonical_ext(filename, got).lower() != head.ext.lower():
+                raise SessionError(422, f"L'estensione del file ({canonical_ext(filename, got)}) non corrisponde a quella "
+                                        f"del progetto ({head.ext})")
+            if hashlib.sha256(data).hexdigest() == head.sha256:
+                raise SessionError(422, "Il file e' identico al Master corrente: nulla da reimportare")
+            rev = self.store.commit(data, dev.name, f"Reimportazione del Master: {reason}", None,
+                                    filename=filename, rename=True)
+            self._log_audit("master_reimported", dev.name, f"rev{rev.revision}", previous_head=head.revision,
+                            sha256=rev.sha256, kind=rev.kind, ext=rev.ext, name=rev.name,
+                            filename=(filename or "")[:120], reason=reason[:300])
+            self._broadcast("master_updated", f"Master reimportato da {dev.name} (rev {rev.revision}): {reason}",
+                            revision=rev.revision)
+            self._after_master_advance(rev.revision, skip=None)
+            return rev
+
     def housekeeping(self) -> None:
         """Da chiamare periodicamente: esclude dal quorum chi e' scaduto e rivaluta il consenso."""
         with self._lock:
@@ -513,7 +563,7 @@ class SessionManager:
         h: Revision = self.store.head()
         return MasterInfo(revision=h.revision, sha256=h.sha256, updated_at=h.updated_at,
                           updated_by=h.updated_by, message=h.message, proposal_id=h.proposal_id,
-                          kind=h.kind, ext=h.ext)
+                          kind=h.kind, ext=h.ext, name=h.name or "Master")
 
     def _notify_proposal(self, typ: str, p: Proposal, message: str) -> None:
         targets = set(p.required) | {p.author_session}

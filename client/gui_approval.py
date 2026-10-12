@@ -227,10 +227,12 @@ class ApprovalDialog(QDialog):
     proposal_changed = Signal(object)            # ProposalDetail aggiornato (per la finestra principale)
 
     def __init__(self, api: ApiClient, proposal_id: str, my_role: Optional[Role] = None,
-                 run: Callable = run_async, parent: Optional[QWidget] = None, master_ext: str = ".L5X"):
+                 run: Callable = run_async, parent: Optional[QWidget] = None, master_ext: str = ".L5X",
+                 master_name: str = "Master"):
         super().__init__(parent)
         self.api, self.pid, self._run = api, proposal_id, run
         self.master_ext = master_ext or ".L5X"
+        self.master_name = master_name or "Master"
         self.me = api.session_key
         self.role = my_role if my_role is not None else api.role
         self.detail: Optional[ProposalDetail] = None
@@ -528,7 +530,7 @@ class ApprovalDialog(QDialog):
 
     def _save_preview(self, path: Optional[str] = None) -> None:
         if not path:
-            path, _ = QFileDialog.getSaveFileName(self, "Salva anteprima", f"Preview_{self.pid}{self.master_ext}",
+            path, _ = QFileDialog.getSaveFileName(self, "Salva anteprima", f"{self.master_name}_anteprima{self.master_ext}",
                                                   f"File del progetto (*{self.master_ext});;Tutti i file (*)")
         if path:
             self._run(lambda: self.api.save_preview(self.pid, Path(path)),

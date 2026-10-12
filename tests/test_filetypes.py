@@ -133,7 +133,7 @@ def test_store_keeps_extension_per_project(tmp_path):
     st = MasterStore(tmp_path / "p")
     rev = st.commit(l5k().encode(), "admin", "init", filename="Linea1.L5K")
     assert (rev.kind, rev.ext) == ("l5k", ".L5K")
-    assert (tmp_path / "p" / "Master.L5K").exists() and (tmp_path / "p" / "revisions" / "rev_000001.L5K").exists()
+    assert (tmp_path / "p" / "Linea1.L5K").exists() and rev.name == "Linea1" and (tmp_path / "p" / "revisions" / "rev_000001.L5K").exists()
     st.commit(l5k(r02="XIC(G)OTE(Q);").encode(), "admin", "due", filename="ignorato.xyz")   # le revisioni ereditano
     assert st.ext == ".L5K" and st.has_revision(2) and not st.has_revision(3)
     again = MasterStore(tmp_path / "p")                                # ricaricato da history.json

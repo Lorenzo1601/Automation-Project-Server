@@ -115,6 +115,7 @@ class ProjectOut(BaseModel):
     head_revision: Optional[int] = None         # None = Master non ancora inizializzato
     master_kind: Optional[str] = None           # tipo/estensione del Master (None finche' non e' inizializzato)
     master_ext: Optional[str] = None
+    master_name: Optional[str] = None
 
 
 class ProjectCreate(BaseModel):
@@ -182,6 +183,7 @@ class MasterInfo(BaseModel):
     proposal_id: Optional[str] = None
     kind: str = "l5x"                  # l5x | l5k | text | binary (common.filekinds)
     ext: str = ".L5X"                  # estensione del Master (fissata dal primo file importato)
+    name: str = "Master"               # nome del file importato, senza estensione (i client lo mantengono)
 
 
 # ----------------------------------------------------------- diff / merge

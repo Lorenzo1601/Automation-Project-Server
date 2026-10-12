@@ -71,3 +71,29 @@ def file_dialog_filters(ext: str = "", kind: str = "") -> str:
 def import_filters() -> str:
     """Filtri per scegliere il Master iniziale: tutti i file in testa, e Rockwell L5K/L5X a portata di mano."""
     return "Tutti i file (*);;Rockwell (*.L5K *.L5X *.l5k *.l5x);;Rockwell L5K (*.L5K *.l5k);;Rockwell L5X (*.L5X *.l5x)"
+
+
+# ----------------------------------------------------------------------------- nome del file del Master
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_REV_SUFFIX = re.compile(r"[ _-]*rev\d+$", re.I)
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+DEFAULT_NAME = "Master"
+
+
+def safe_stem(filename: str, fallback: str = DEFAULT_NAME) -> str:
+    """Nome del file importato, senza estensione e senza caratteri vietati nei nomi file di Windows.
+
+    Se il file si chiamava gia' ``Linea1_rev5.L5K`` il suffisso ``_rev5`` viene tolto: i file distribuiti ai client
+    portano al massimo UN numero di revisione in fondo al nome (``Linea1_rev6.L5K``).
+    """
+    stem = PurePath((filename or "").replace("\\", "/")).stem
+    stem = _BAD_CHARS.sub("_", stem).strip(" .")
+    stem = _REV_SUFFIX.sub("", stem).strip(" ._-")
+    if stem.upper() in _RESERVED:
+        stem += "_"
+    return stem[:120] or fallback
+
+
+def rev_filename(name: str, revision: int, ext: str) -> str:
+    """``<nome>_revN<ext>``: il nome del file importato con il numero di revisione in fondo."""
+    return f"{name or DEFAULT_NAME}_rev{revision}{ext}"

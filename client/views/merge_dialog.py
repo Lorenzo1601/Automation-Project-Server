@@ -28,10 +28,10 @@ def human_size(n: int) -> str:
 class MergeRequestDialog(QDialog):
     def __init__(self, folder: "str | Path", working_file: str, base_rev: int, project_name: str = "",
                  parent: Optional[QWidget] = None, scan: Callable[..., list[Candidate]] = find_merge_candidates,
-                 ext: str = ".L5X", kind: str = L5X):
+                 ext: str = ".L5X", kind: str = L5X, name: str = ""):
         super().__init__(parent)
         self.folder, self.working_file, self._scan = Path(folder), working_file, scan
-        self.ext, self.kind = norm_ext(ext), kind
+        self.ext, self.kind, self.name, self.base_rev = norm_ext(ext), kind, name, base_rev
         self._cands: list[Candidate] = []
         self.setWindowTitle("Richiedi Merge")
         self.setMinimumSize(760, 520)
@@ -120,7 +120,8 @@ class MergeRequestDialog(QDialog):
         keep = keep if isinstance(keep, Path) else self.selected_path()
         extras = [c for c in self._cands if c.path.parent != self.folder and not str(c.path).startswith(str(self.folder))]
         self._cands = self._scan(self.folder, self.working_file, ext=self.ext, kind=self.kind,
-                                 all_files=self.chk_all.isChecked()) + [e for e in extras if e.path.exists()]
+                                 all_files=self.chk_all.isChecked(), name=self.name,
+                                 base_rev=self.base_rev) + [e for e in extras if e.path.exists()]
         self._fill()
         if not (keep and self.select_path(keep)):
             d = pick_default(self._cands)

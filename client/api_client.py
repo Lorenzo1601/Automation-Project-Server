@@ -169,6 +169,13 @@ class ApiClient:
             r = self._req("POST", f"/api/projects/{pid}/master/init", files={"file": (file.name, f, "application/octet-stream")})
         return MasterInfo(**r.json())
 
+    def reimport_master_for(self, pid: int, file: Path, reason: str) -> MasterInfo:
+        """Reimporta il file base (Master) di un progetto in corso: nuova revisione (Lead/Admin)."""
+        with open(file, "rb") as f:
+            r = self._req("POST", f"/api/projects/{pid}/master/reimport", data={"reason": reason},
+                          files={"file": (file.name, f, "application/octet-stream")})
+        return MasterInfo(**r.json())
+
     # -------------------------------------------------------------------- audit
     def audit(self, project_id: Optional[int] = None, action: Optional[str] = None, actor: Optional[str] = None,
               limit: int = 300) -> list[AuditOut]:

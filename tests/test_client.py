@@ -343,11 +343,12 @@ def test_main_window_login_workspace_and_push(live, qapp, tmp_path):
     assert win.sidebar.buttons["users"].isHidden()                                 # solo l'Admin gestisce gli utenti
     assert not win.dashboard.btn_merge.isHidden() and "Master rev" in win.dashboard.lbl_master.text()
 
-    win.checkout()                                                                  # scarica Lavoro_revN + Master.L5X
-    files = sorted(p.name for p in win.workdir.glob("*.L5X"))
-    assert "Master.L5X" in files and any(f.startswith("Lavoro_rev") for f in files)
+    win.checkout()                       # scarica <nome del file importato>_revN.L5X + copia pulita nella cartella nascosta .aps
     rev = win.base_revision
-    assert rev >= 1 and win.working_file.endswith(f"Lavoro_rev{rev}.L5X")
+    assert rev >= 1 and win.master_name == "master"                                # il Master era stato importato come master.L5X
+    assert [p.name for p in win.workdir.glob("*.L5X")] == [f"master_rev{rev}.L5X"]
+    assert win.working_file.endswith(f"master_rev{rev}.L5X") and Path(win.working_file).exists()
+    assert (win.workdir / ".aps" / f"master_rev{rev}.L5X").read_bytes() == Path(win.working_file).read_bytes()
 
     # notifiche push: un altro utente invia una richiesta -> si apre la schermata di consenso
     assert pump(qapp, lambda: win.ws.is_up), "WebSocket non connesso"
@@ -373,7 +374,7 @@ def test_viewer_window_is_read_only(live, qapp, tmp_path):
     assert win.project_role == Role.VIEWER
     assert win.dashboard.btn_merge.isHidden() and "Scarica" in win.dashboard.btn_checkout.text()
     win.checkout()
-    assert list(win.workdir.glob("Master_rev*.L5X")) and not (win.workdir / "Master.L5X").exists()
+    assert list(win.workdir.glob("master_rev*.L5X")) and not (win.workdir / ".aps").exists()      # nessuna copia pulita
     assert win.base_revision == 0                                                  # il Viewer non ha una copia di lavoro
     win._nav("audit")
     assert win.audit.table.rowCount() > 0 and win.audit.btn_verify.isHidden()
@@ -530,7 +531,7 @@ def test_window_local_folder_choice_checkout_and_merge_scan(live, qapp, tmp_path
 
     win.checkout()                                                                   # primo checkout: chiede la cartella
     assert len(asked) == 1 and "Linea 1" in asked[0][0] and win.folder_chosen
-    assert win.local_folder == chosen and (chosen / "Master.L5X").exists()
+    assert win.local_folder == chosen and (chosen / ".aps").is_dir() and Path(win.working_file).exists()
     assert win.working_file.startswith(str(chosen)) and str(chosen) in win.dashboard.lbl_folder.text()
     assert "proposta" not in win.dashboard.lbl_folder.text()
     win.checkout()
@@ -547,7 +548,7 @@ def test_window_local_folder_choice_checkout_and_merge_scan(live, qapp, tmp_path
         return QDialog.Accepted
     monkeypatch.setattr(MergeRequestDialog, "exec", fake_exec)
     win.request_merge()
-    assert seen["folder"] == chosen and "mie_modifiche.L5X" in seen["names"] and "Master.L5X" not in seen["names"]
+    assert seen["folder"] == chosen and "mie_modifiche.L5X" in seen["names"] and not any(".aps" in n for n in seen["names"])
     assert seen["default"] == chosen / "mie_modifiche.L5X"
     props = win.api.proposals()
     mine = [p for p in props if p.message == "scansione cartella"]
@@ -572,8 +573,9 @@ def test_window_with_l5k_master_uses_l5k_extension_everywhere(live_l5k, qapp, tm
     assert win.master_ext == ".L5K" and win.master_kind == "l5k"
     win.checkout()
     ws = win.local_folder
-    assert (ws / "Master.L5K").exists() and (ws / "Lavoro_rev1.L5K").exists() and not list(ws.glob("*.L5X"))
-    assert win.working_file.endswith("Lavoro_rev1.L5K")
+    assert win.master_name == "Linea1"
+    assert (ws / ".aps" / "Linea1_rev1.L5K").exists() and (ws / "Linea1_rev1.L5K").exists() and not list(ws.glob("*.L5X"))
+    assert win.working_file.endswith("Linea1_rev1.L5K")
 
     (ws / "mia.L5K").write_text(l5k(r01a="XIC(A)XIC(Z)OTE(B);"), "utf-8")
     (ws / "vecchio.L5X").write_text(S.dev_a(), "utf-8")
@@ -587,7 +589,7 @@ def test_window_with_l5k_master_uses_l5k_extension_everywhere(live_l5k, qapp, tm
     monkeypatch.setattr(MergeRequestDialog, "exec", fake_exec)
     win.request_merge()
     assert seen["ext"] == ".L5K" and seen["kind"] == "l5k"
-    assert "mia.L5K" in seen["names"] and "vecchio.L5X" not in seen["names"] and "Master.L5K" not in seen["names"]
+    assert "mia.L5K" in seen["names"] and "vecchio.L5X" not in seen["names"] and "Linea1_rev1.L5K" in seen["names"]
     assert seen["default"] == ws / "mia.L5K"
     mine = [p for p in win.api.proposals() if p.message == "merge L5K"]
     assert mine and mine[0].n_changes == 1
@@ -598,7 +600,7 @@ def test_window_with_l5k_master_uses_l5k_extension_everywhere(live_l5k, qapp, tm
                         staticmethod(lambda *a, **k: (saved.append(a) or str(tmp_path / "salvato.L5K"), "")))
     win._download_revision(1)
     assert (tmp_path / "salvato.L5K").read_bytes() == l5k().encode()
-    assert saved[0][2] == "Master_rev1.L5K" and "Tutti i file (*)" in saved[0][3]
+    assert saved[0][2] == "Linea1_rev1.L5K" and "Tutti i file (*)" in saved[0][3]
     win.ws.stop()
     win.close()
 
@@ -619,3 +621,65 @@ def test_init_master_dialog_offers_all_files_filter(live, qapp, monkeypatch):
     assert view.current_project() is not None
     view.init_master()
     assert seen["filters"].startswith("Tutti i file (*)") and "*.L5K" in seen["filters"] and "*.L5X" in seen["filters"]
+
+
+def test_sidebar_items_are_left_aligned_in_server_and_client(qapp):
+    from PySide6.QtWidgets import QWidget
+    from client.views.sidebar import CLIENT_NAV, Sidebar
+    from server.gui.main_window import SERVER_NAV
+    for nav, kw in ((SERVER_NAV, dict(show_projects=False, admin_only=(), show_password=False)), (CLIENT_NAV, {})):
+        host = QWidget()
+        sb = Sidebar(host, nav=nav, **kw)
+        sb.resize(248, 420)
+        host.resize(248, 420)
+        host.show()
+        qapp.processEvents()
+        icons = {b._icon.mapTo(sb, b._icon.rect().topLeft()).x() for b in sb.buttons.values()}
+        labels = {b._label.mapTo(sb, b._label.rect().topLeft()).x() for b in sb.buttons.values()}
+        widths = {b.width() for b in sb.buttons.values()}
+        assert len(icons) == 1 and len(labels) == 1 and widths == {248}, (icons, labels, widths)   # tutte sullo stesso asse
+        assert [b.text() for b in sb.buttons.values()] == [t for _k, _i, t in nav]
+        assert "&" in sb.buttons["users"]._label.text() if nav is SERVER_NAV else True
+        sb.select(nav[-1][0])
+        assert sb.buttons[nav[-1][0]].isChecked() and not sb.buttons[nav[0][0]].isChecked()
+        assert T_ACCENT in sb.buttons[nav[-1][0]]._label.styleSheet() and T_ACCENT not in sb.buttons[nav[0][0]]._label.styleSheet()
+
+
+T_ACCENT = __import__("client.theme.tokens", fromlist=["T"]).T["ACCENT"]
+
+
+def test_checkout_keeps_imported_file_name_and_never_overwrites_edits(live, qapp, tmp_path):
+    win = _window(live, tmp_path, "dev1", heartbeat_ms=60_000)
+    win._do_login(live["url"], "dev1", PW)
+    win.checkout()
+    rev, work = win.base_revision, Path(win.working_file)
+    assert work.name == f"master_rev{rev}.L5X" and work.parent == win.local_folder      # nome importato + _revN, nient'altro
+    assert (win.local_folder / ".aps" / work.name).exists()
+    clean = work.read_bytes()
+
+    work.write_text(S.dev_a(), "utf-8")                                                # il programmatore lavora sul file
+    win.checkout()                                                                      # secondo checkout della stessa revisione
+    assert work.read_text("utf-8") == S.dev_a()                                         # le modifiche NON vengono cancellate
+    assert (win.local_folder / ".aps" / work.name).read_bytes() == clean                # la copia pulita resta quella del Master
+    assert sorted(p.name for p in win.local_folder.glob("*.L5X")) == [work.name]       # nessun file extra con altri nomi
+
+    win._auto_sync(rev)                                                                 # il push dello stesso Master non lo tocca
+    assert work.read_text("utf-8") == S.dev_a()
+    win.ws.stop()
+    win.close()
+
+
+def test_auto_sync_downloads_new_revision_with_name_and_revision(live, qapp, tmp_path):
+    win = _window(live, tmp_path, "dev2", heartbeat_ms=60_000)
+    win._do_login(live["url"], "dev2", PW)
+    win.checkout()
+    head = win.api.master_info().revision
+    folder = win.local_folder
+    (folder / f"master_rev{head}.L5X").unlink()
+    (folder / ".aps" / f"master_rev{head}.L5X").unlink()
+    win.settings.setValue(win._base_key() + "/file", str(folder / "master_rev0.L5X"))     # il lavoro e' su un'altra revisione
+    win._auto_sync(head)                                # push 'master_updated': copia visibile + copia pulita, col nome importato
+    assert (folder / f"master_rev{head}.L5X").exists() and (folder / ".aps" / f"master_rev{head}.L5X").exists()
+    assert sorted(p.name for p in folder.glob("*.L5X")) == [f"master_rev{head}.L5X"]
+    win.ws.stop()
+    win.close()
