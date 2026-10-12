@@ -1,0 +1,4 @@
+-r requirements-server.txt
+-r requirements-client.txt
+pytest>=8
+-r requirements-service.txt
