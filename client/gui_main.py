@@ -24,6 +24,7 @@ from client.theme import apply_dark_theme
 from client.theme.tokens import T
 from client.theme.widgets import app_icon, icon
 from client.views.audit_view import AuditView
+from client.views.common import ScrollStack, fit_to_screen
 from client.views.branches_dialog import BranchesDialog
 from client.views.dashboard_view import DashboardView
 from client.views.help_view import HelpView
@@ -71,7 +72,7 @@ class MainWindow(QMainWindow):
         self.settings = settings or QSettings("AutomationProjectServer", "Client2")
         self.setWindowTitle("Automation Project Client")
         self.setWindowIcon(app_icon())
-        self.resize(1360, 840)
+        fit_to_screen(self, 1360, 840)
         self.api: Optional[ApiClient] = None
         self.project: Optional[ProjectOut] = None
         self.projects: list[ProjectOut] = []
@@ -191,7 +192,7 @@ class MainWindow(QMainWindow):
         self.audit = AuditView()
         self.users = UserMgmtView(api, run=self._run)
         self.help = HelpView()
-        self.pages = QStackedWidget()
+        self.pages = ScrollStack()
         for w in (self.dashboard, self.audit, self.users, self.help):
             self.pages.addWidget(w)
         if not hasattr(self, "_f1"):                                # F1: apre la Guida (una sola volta)

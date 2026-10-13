@@ -7,8 +7,8 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QTableWidget,
-                               QTableWidgetItem, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QScrollArea, QSizePolicy,
+                               QStackedWidget, QTableWidget, QTableWidgetItem, QWidget)
 
 from client.theme.tokens import FONT_MONO, FONT_UI, T
 from client.theme.widgets import role_color
@@ -177,3 +177,52 @@ def polish(w: QWidget) -> None:
     """Riapplica lo stile dopo il cambio di una dynamic property."""
     w.style().unpolish(w)
     w.style().polish(w)
+
+
+class ScrollStack(QStackedWidget):
+    """``QStackedWidget`` le cui pagine stanno in un'area scorrevole: la finestra puo' essere ridimensionata a piacere
+    (anche piu' piccola del contenuto, che si scorre) e non viene piu' tagliata dallo schermo.
+    ``currentWidget()`` e ``widget(i)`` restituiscono la pagina vera, non il contenitore."""
+
+    MIN_W, MIN_H = 480, 320
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._pages: list[QWidget] = []
+
+    def addWidget(self, w: QWidget) -> int:                                  # noqa: N802
+        sa = QScrollArea()
+        sa.setObjectName("pageScroll")
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.NoFrame)
+        sa.setStyleSheet("QScrollArea#pageScroll, QScrollArea#pageScroll > QWidget > QWidget { background: transparent; }")
+        sa.setWidget(w)
+        sa.setMinimumSize(self.MIN_W, self.MIN_H)
+        sa.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._pages.append(w)
+        return super().addWidget(sa)
+
+    def currentWidget(self) -> Optional[QWidget]:                            # noqa: N802
+        i = self.currentIndex()
+        return self._pages[i] if 0 <= i < len(self._pages) else None
+
+    def widget(self, i: int) -> Optional[QWidget]:
+        return self._pages[i] if 0 <= i < len(self._pages) else None
+
+    def setCurrentWidget(self, w: QWidget) -> None:                          # noqa: N802
+        if w in self._pages:
+            self.setCurrentIndex(self._pages.index(w))
+
+    def minimumSizeHint(self):                                               # noqa: N802
+        from PySide6.QtCore import QSize
+        return QSize(self.MIN_W, self.MIN_H)
+
+
+def fit_to_screen(win: QWidget, w: int, h: int) -> None:
+    """Dimensione iniziale ``w`` x ``h`` ridotta, se serve, allo spazio utile dello schermo (barra delle applicazioni esclusa)."""
+    from PySide6.QtGui import QGuiApplication
+    scr = QGuiApplication.primaryScreen()
+    if scr is not None:
+        a = scr.availableGeometry()
+        w, h = min(w, max(640, a.width() - 40)), min(h, max(480, a.height() - 40))
+    win.resize(w, h)

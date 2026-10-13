@@ -19,7 +19,7 @@ from client.theme import mono_font
 from client.theme.tokens import T
 from client.theme.widgets import StatusLed, app_icon, icon
 from client.views.audit_view import ACTIONS, ACTION_COLORS, AuditView
-from client.views.common import full_time, heading, item, make_table, muted
+from client.views.common import ScrollStack, fit_to_screen, full_time, heading, item, make_table, muted
 from client.views.sidebar import Sidebar
 from client.views.user_mgmt_view import UserMgmtView
 from client.workers import run_async
@@ -462,7 +462,7 @@ class ServerWindow(QMainWindow):
         self._pending_admin: Optional[tuple[str, str]] = None        # (utente, password) per il primo avvio
         self.setWindowTitle("Automation Project Server")
         self.setWindowIcon(app_icon())
-        self.resize(1240, 800)
+        fit_to_screen(self, 1240, 800)
         self.workspace: Optional[QWidget] = None
         self._timer = QTimer(self, interval=stats_ms)
         self._timer.timeout.connect(self.refresh_stats)
@@ -536,7 +536,7 @@ class ServerWindow(QMainWindow):
         self.audit.set_role(Role.ADMIN)
         self.audit.lock_scope_to_all()
         self.settings_page = SettingsPage()
-        self.pages = QStackedWidget()
+        self.pages = ScrollStack()
         for w in (self.status, self.users, self.audit, self.settings_page):
             self.pages.addWidget(w)
         root = QWidget()

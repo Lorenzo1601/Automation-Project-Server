@@ -298,3 +298,17 @@ def test_window_start_error_is_reported(qapp, tmp_path, monkeypatch):
     finally:
         busy.close()
         w.close()
+
+
+def test_window_can_shrink_below_content_and_pages_scroll(qapp, tmp_path):
+    """Regressione: la finestra non deve avere un minimo piu' alto dello schermo (le pagine lunghe scorrono)."""
+    w = make_window(tmp_path)
+    assert w.start()
+    w.show()
+    hint = w.minimumSizeHint()
+    assert hint.height() <= 600 and hint.width() <= 1000, hint
+    w.resize(900, 560)                                                # ridimensionabile
+    assert w.height() <= 600
+    w._nav("settings")
+    assert w.pages.currentWidget() is w.settings_page
+    w.close()
