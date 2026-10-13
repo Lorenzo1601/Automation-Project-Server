@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 
 def version_tuple(v: str) -> tuple[int, ...]:

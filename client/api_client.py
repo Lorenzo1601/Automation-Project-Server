@@ -18,7 +18,7 @@ from common.roles import Role
 from common.schemas_branches import BranchCreate, BranchOut
 from common.schemas_inbox import NotificationOut, UpdateInfo
 from common.schemas_revisions import CompareOut, LockIn, LockOut, RevisionPatchIn
-from common.schemas import (AccountPolicy, PreviewOut, AuditOut, AuditVerifyOut, AuthSessionOut, DecisionIn, DeveloperOut, MasterInfo,
+from common.schemas import (AccountPolicy, PreviewOut, AuditOut, AuditVerifyOut, AuthSessionOut, DecisionIn, DeveloperOut, MasterInfo, PresenceContext, PresenceOut,
                             PermissionIn, PermissionOut, ProjectCreate, ProjectDeleteOut, ProjectOut, ProjectUpdate,
                             ProposalDetail, ProposalSummary, ResolutionIn, ResolutionsIn, RestoreIn, RoleOut,
                             TokenPair, UserCreate, UserOut, UserUpdate)
@@ -355,6 +355,19 @@ class ApiClient:
     def developers(self) -> list[DeveloperOut]:
         return [DeveloperOut(**d) for d in self._req("GET", self._p("/developers")).json()]
 
+    def presence(self) -> list[PresenceOut]:
+        """Stato dei colleghi (Master/branch, revisione di lavoro, lock). Con server vecchi ripiega su /developers."""
+        try:
+            return [PresenceOut(**d) for d in self._req("GET", self._p("/presence"), branch=None).json()]
+        except ApiError as e:
+            if e.status not in (404, 405):
+                raise
+        out = []
+        for d in self.developers():
+            out.append(PresenceOut(username=d.developer, role=d.role, online=d.connected, contexts=[
+                PresenceContext(branch="", branch_name="Master", revision=d.checked_out_revision, online=d.connected)]))
+        return out
+
     # ----------------------------------------------------------------- proposte
     def submit_proposal(self, file: Path, base_revision: int, message: str = "") -> ProposalDetail:
         with open(file, "rb") as f:
@@ -390,6 +403,19 @@ class ApiClient:
     def reject(self, pid: str, comment: str = "") -> ProposalDetail:
         return ProposalDetail(**self._req("POST", self._p(f"/proposals/{pid}/reject"),
                                           json=DecisionIn(comment=comment).model_dump()).json())
+
+    # varianti con progetto / branch espliciti (risposta rapida dalle notifiche, anche per un altro progetto)
+    def _prop_url(self, project_id: int, pid: str, tail: str = "") -> str:
+        return f"/api/projects/{project_id}/proposals/{pid}{tail}"
+
+    def proposal_for(self, project_id: int, branch: Optional[str], pid: str) -> ProposalDetail:
+        r = self._req("GET", self._prop_url(project_id, pid), branch=None, params={"branch": branch} if branch else None)
+        return ProposalDetail(**r.json())
+
+    def decide_for(self, project_id: int, branch: Optional[str], pid: str, approve: bool, comment: str = "") -> ProposalDetail:
+        r = self._req("POST", self._prop_url(project_id, pid, "/approve" if approve else "/reject"), branch=None,
+                      params={"branch": branch} if branch else None, json=DecisionIn(comment=comment).model_dump())
+        return ProposalDetail(**r.json())
 
     def cancel(self, pid: str) -> ProposalDetail:
         return ProposalDetail(**self._req("POST", self._p(f"/proposals/{pid}/cancel")).json())

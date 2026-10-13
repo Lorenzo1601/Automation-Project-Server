@@ -15,7 +15,7 @@ from client.theme.widgets import (Avatar, EmptyState, StatusBadge, badge_color, 
 from client.views.common import (chip, drop_widget, eyebrow, full_time, h_line, heading, human_time, item, make_table,
                                  muted, role_chip, short_unit, tint)
 from common.roles import Role
-from common.schemas import ACTIVE_STATES, DeveloperOut, MasterInfo, ParticipantOut, ProposalSummary
+from common.schemas import ACTIVE_STATES, DeveloperOut, MasterInfo, PresenceOut, ParticipantOut, ProposalSummary
 from common.schemas_branches import BranchOut
 from common.schemas_revisions import LockOut
 
@@ -513,6 +513,44 @@ class DashboardView(QWidget):
     def set_proposals(self, items: list[ProposalSummary]) -> None:
         self._proposals = items
         self._rebuild()
+
+    def set_presence(self, people: list[PresenceOut]) -> None:
+        """Colleghi con, per ciascuno, dove lavorano (Master / branch), da quale revisione e chi tiene il lock."""
+        while self.devs.count():
+            w = self.devs.takeAt(0).widget()
+            if w:
+                drop_widget(w)
+        for d in people:
+            row = QWidget()
+            row.setObjectName("cell")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+            rl.addWidget(Avatar(d.username, 30, ring=T["GREEN"] if d.online else None))
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            n = QLabel(d.username)
+            n.setStyleSheet("font-weight:600;")
+            role = d.role or ""
+            sub = QLabel(role.replace("_", " "))
+            sub.setStyleSheet(f"color:{role_color(role) if role else T['MUTED']}; font-size:11px;")
+            col.addWidget(n)
+            col.addWidget(sub)
+            for c in d.contexts:
+                where = c.branch_name or c.branch or "Master"
+                txt = f"{'● ' if c.online else '○ '}{where}" + (f" · rev {c.revision}" if c.revision else "")
+                if c.holds_lock:
+                    txt += " · 🔒 ha in carico il Master"
+                cl = QLabel(txt)
+                cl.setStyleSheet(f"color:{T['GREEN'] if c.online else T['MUTED']}; font-size:11px;")
+                cl.setObjectName("presence_ctx")
+                col.addWidget(cl)
+            rl.addLayout(col, 1)
+            self.devs.addWidget(row)
+        online = sum(1 for d in people if d.online)
+        self.lbl_online.setText(f"{online} online" if people else "")
+        if not people:
+            self.devs.addWidget(EmptyState("users", "Nessuno connesso", "", dashed=False, compact=True))
 
     def set_developers(self, devs: list[DeveloperOut]) -> None:
         while self.devs.count():

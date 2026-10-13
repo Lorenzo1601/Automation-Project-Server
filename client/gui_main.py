@@ -512,7 +512,7 @@ class MainWindow(QMainWindow):
             return lambda res: cb(res) if live() else None
         self._run(api.master_info, guarded(lambda m: self.dashboard.set_master(name, m)), master_err)
         self._run(lambda: api.proposals(), guarded(self.dashboard.set_proposals), self._quiet_err)
-        self._run(api.developers, guarded(self.dashboard.set_developers), self._quiet_err)
+        self._run(api.presence, guarded(self.dashboard.set_presence), self._quiet_err)
         self._run(api.projects, self._refresh_projects_meta, self._quiet_err)
         self.refresh_lock()
         self.load_branches()
@@ -1236,7 +1236,7 @@ class MainWindow(QMainWindow):
             self.refresh_all()
             return
         if t in ("developer_joined", "developer_left"):
-            self._run(self.api.developers, self.dashboard.set_developers, self._quiet_err)
+            self._run(self.api.presence, self.dashboard.set_presence, self._quiet_err)
             return
         if self.tray and t in ("proposal_submitted", "proposal_rejected", "proposal_merged", "master_updated"):
             self.tray.showMessage("Automation Project", msg)

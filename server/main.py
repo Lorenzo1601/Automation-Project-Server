@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from common.version import APP_VERSION
 from common.roles import Role
 from common.schemas import (AuditOut, AuditVerifyOut, DecisionIn, DeveloperOut, Event, MasterInfo,
-                            PreviewOut, ProposalDetail, ProposalSummary, ResolutionsIn, RestoreIn)
+                            PresenceContext, PresenceOut, PreviewOut, ProposalDetail, ProposalSummary, ResolutionsIn, RestoreIn)
 from server.auth import routes as auth_routes
 from server.auth.models import AuthError, Principal, ProjectAccess
 from server.auth.rbac import effective_project_role, get_principal, min_role, project_access
@@ -39,7 +39,7 @@ from server.updates import build_router as updates_router
 from server.branches import build_router as branches_router, check_write as check_branch_write
 from server.projects import BranchNotFound, ProjectGone, ProjectRegistry, ProjectRuntime
 from server.projects import build_router as projects_router
-from server.revisions_ext import build_router as revisions_router
+from server.revisions_ext import build_router as revisions_router, lock_out, locks_for
 from server.session_manager import Developer, SessionError
 from server.storage import RevisionPurged
 
@@ -208,6 +208,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def restore(body: RestoreIn, c: Ctx = Depends(ctx(Role.ADMIN))):
         c.rt.mgr.restore(c.dev, body.revision, body.reason)
         return c.rt.mgr.master_info()
+
+    @app.get(P + "/presence", response_model=list[PresenceOut], tags=["presenza"])
+    def presence(c: Ctx = Depends(ctx(Role.VIEWER, use_branch=False))):
+        """Chi c'e' nel progetto: per ogni collega, dove sta lavorando (principale / branch), da quale revisione e se ha in carico il Master."""
+        out: dict[str, PresenceOut] = {}
+        for rt in [registry.runtime(c.access.project_id)] + registry.branch_runtimes(c.access.project_id):
+            holder = ""
+            try:
+                holder = lock_out(locks_for(rt, cfg), "").holder
+            except Exception:                                    # noqa: BLE001
+                pass
+            for d in rt.mgr.developers():
+                po = out.setdefault(d.developer, PresenceOut(username=d.developer, role=d.role))
+                po.contexts.append(PresenceContext(branch=rt.branch or "", branch_name=rt.branch_name or "",
+                                                   revision=d.checked_out_revision, online=d.connected,
+                                                   holds_lock=bool(holder) and holder == d.developer))
+                po.online = po.online or d.connected
+        return sorted(out.values(), key=lambda x: (not x.online, x.username))
 
     @app.post(P + "/heartbeat", status_code=204, tags=["presenza"])
     def heartbeat(revision: Optional[int] = None, c: Ctx = Depends(ctx(Role.VIEWER))):

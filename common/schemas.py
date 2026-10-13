@@ -213,6 +213,22 @@ class DeveloperOut(BaseModel):
     last_seen: datetime
 
 
+class PresenceContext(BaseModel):
+    branch: str = ""                  # slug del branch ("" = principale)
+    branch_name: str = ""
+    revision: int = 0                 # revisione da cui sta lavorando (ultima scaricata)
+    online: bool = False
+    holds_lock: bool = False          # ha in carico il Master / il branch
+
+
+class PresenceOut(BaseModel):
+    """Un collega con tutti i punti in cui e' presente nel progetto (principale e branch)."""
+    username: str
+    role: str = ""
+    online: bool = False
+    contexts: list[PresenceContext] = []
+
+
 class MasterInfo(BaseModel):
     revision: int
     sha256: str

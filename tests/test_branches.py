@@ -1215,3 +1215,21 @@ def test_dry_run_plain_proposal(tworld):
     same = c.post(f"/api/projects/{pid}/proposals/dry-run", headers=H["dev1"], data={"base_revision": 1},
                   files={"file": ("m.txt", text_master())}).json()
     assert same["nothing_to_merge"]
+
+
+# =================================================================================== presenza dei colleghi
+def test_presence_lists_contexts_revisions_and_lock(tworld):
+    c, app, pid, H, _ = tworld
+    mk(c, pid, H["lead"], "squadra", "team")
+    for n in ("dev1", "dev2"):
+        c.post(f"/api/projects/{pid}/heartbeat?revision=1", headers=H[n])
+    c.post(f"/api/projects/{pid}/heartbeat?branch=squadra&revision=1", headers=H["dev2"])
+    assert c.post(f"/api/projects/{pid}/lock", headers=H["dev1"], json={"note": "lavoro"}).status_code == 200
+    r = c.get(f"/api/projects/{pid}/presence", headers=H["viewer"])
+    assert r.status_code == 200, r.text
+    by = {p["username"]: p for p in r.json()}
+    assert by["dev1"]["online"] and [(x["branch"], x["holds_lock"]) for x in by["dev1"]["contexts"]] == [("", True)]
+    assert sorted(x["branch"] for x in by["dev2"]["contexts"]) == ["", "squadra"]
+    assert all(not x["holds_lock"] for x in by["dev2"]["contexts"])
+    assert any(x["branch_name"] == "squadra" for x in by["dev2"]["contexts"])
+    assert c.get(f"/api/projects/{pid}/presence").status_code == 401

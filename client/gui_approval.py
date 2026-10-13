@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import (QButtonGroup, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
                                QRadioButton, QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                                QWidget)
@@ -72,16 +72,47 @@ def compute_permissions(d: ProposalDetail, me: str, role: Role, pending_resoluti
 
 
 # ======================================================================================= modifiche
+def group_key(path: str) -> str:
+    """Routine (o contenitore) a cui appartiene una modifica: ``Program[P]/Routine[R]`` dal path ``.../Rung#3``."""
+    parts = path.split("/")
+    for i, seg in enumerate(parts):
+        if seg.startswith("Routine["):
+            return "/".join(parts[:i + 1])
+    return "/".join(parts[:-1]) if len(parts) > 1 else "(elementi globali)"
+
+
 class ChangeBrowser(QWidget):
-    """Albero delle modifiche senza conflitto + diff Ladder della voce selezionata."""
+    """Albero delle modifiche senza conflitto + diff Ladder della voce selezionata.
+
+    Filtro testuale (routine / programma / tag) e raggruppamento opzionale per routine: selezionando il gruppo
+    si vede il diff affiancato dell'intera routine (tutte le rung modificate, in ordine).
+    """
 
     def __init__(self) -> None:
         super().__init__()
+        self._author = ""
+        self._mine: list[ChangeOut] = []
+        self._upstream: list[ChangeOut] = []
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Elemento", "Tipo", "Origine"])
         self.tree.setColumnWidth(0, 310)
         self.tree.setColumnWidth(1, 90)
         self.tree.setRootIsDecorated(True)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filtra per routine, programma o tag...")
+        self.filter.setClearButtonEnabled(True)
+        self.chk_group = QCheckBox("Raggruppa per routine")
+        self.lbl_count = QLabel()
+        self.lbl_count.setProperty("muted", True)
+        frow = QHBoxLayout()
+        frow.addWidget(self.filter, 1)
+        frow.addWidget(self.chk_group)
+        frow.addWidget(self.lbl_count)
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.addLayout(frow)
+        ll.addWidget(self.tree, 1)
         self.path = QLabel()
         self.path.setProperty("muted", True)
         self.path.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -92,7 +123,7 @@ class ChangeBrowser(QWidget):
         lay.addWidget(self.path)
         lay.addWidget(self.diff, 1)
         sp = QSplitter()
-        sp.addWidget(self.tree)
+        sp.addWidget(left)
         sp.addWidget(right)
         sp.setStretchFactor(1, 3)
         sp.setSizes([520, 700])
@@ -100,35 +131,85 @@ class ChangeBrowser(QWidget):
         outer.setContentsMargins(0, 8, 0, 0)
         outer.addWidget(sp)
         self.tree.currentItemChanged.connect(self._selected)
+        self.filter.textChanged.connect(lambda _t: self._rebuild())
+        self.chk_group.toggled.connect(lambda _c: self._rebuild())
 
+    # ------------------------------------------------------------------ dati
     def set_changes(self, author: str, mine: list[ChangeOut], upstream: list[ChangeOut]) -> None:
+        self._author, self._mine, self._upstream = author, list(mine), list(upstream)
+        self._rebuild()
+
+    def titles(self, n_mine: int, n_up: int) -> tuple[str, str]:
+        return (f"Modifiche proposte da {self._author} ({n_mine})", f"Già presenti nel Master dopo la base ({n_up})")
+
+    def _match(self, ch: ChangeOut) -> bool:
+        q = self.filter.text().strip().lower()
+        return not q or q in f"{ch.path} {ch.title} {ch.label}".lower()
+
+    def _rebuild(self) -> None:
+        self.tree.blockSignals(True)
         self.tree.clear()
+        self.tree.blockSignals(False)
         self.diff.set_diff("", "")
         self.path.setText("")
-        for title, items in ((f"Modifiche proposte da {author} ({len(mine)})", mine),
-                             (f"Già presenti nel Master dopo la base ({len(upstream)})", upstream)):
+        mine = [c for c in self._mine if self._match(c)]
+        up = [c for c in self._upstream if self._match(c)]
+        total = len(self._mine) + len(self._upstream)
+        self.lbl_count.setText(f"{len(mine) + len(up)} di {total}" if self.filter.text().strip() else "")
+        grouped = self.chk_group.isChecked()
+        for title, items in zip(self.titles(len(mine), len(up)), (mine, up)):
             top = QTreeWidgetItem([title])
             f = top.font(0)
             f.setBold(True)
             top.setFont(0, f)
             top.setFlags(top.flags() & ~Qt.ItemIsSelectable)
             self.tree.addTopLevelItem(top)
+            groups: dict[str, QTreeWidgetItem] = {}
             for ch in items:
-                it = QTreeWidgetItem([ch.path, KIND_IT[ch.kind], ORIGIN_IT[ch.origin]])
+                parent = top
+                if grouped:
+                    key = group_key(ch.path)
+                    parent = groups.get(key)
+                    if parent is None:
+                        parent = QTreeWidgetItem([key])
+                        parent.setData(0, Qt.UserRole + 1, key)
+                        groups[key] = parent
+                        top.addChild(parent)
+                it = QTreeWidgetItem([ch.path if not grouped else ch.path[len(group_key(ch.path)):].lstrip("/") or ch.path,
+                                      KIND_IT[ch.kind], ORIGIN_IT[ch.origin]])
                 it.setData(0, Qt.UserRole, ch)
                 it.setForeground(1, QBrush(QColor(KIND_COLOR[ch.kind])))
-                top.addChild(it)
+                parent.addChild(it)
+            for key, g in groups.items():
+                g.setText(0, f"{key} ({g.childCount()})")
+                g.setText(1, "routine")
+                g.setExpanded(True)
             top.setExpanded(True)
         first = self.tree.topLevelItem(0)
         if first is not None and first.childCount():
-            self.tree.setCurrentItem(first.child(0))
+            c0 = first.child(0)
+            self.tree.setCurrentItem(c0.child(0) if c0.data(0, Qt.UserRole) is None and c0.childCount() else c0)
+
+    def _labels(self) -> tuple[str, str]:
+        return "Base", "Dopo"
 
     def _selected(self, cur: Optional[QTreeWidgetItem], _prev=None) -> None:     # noqa: ANN001
-        ch: Optional[ChangeOut] = cur.data(0, Qt.UserRole) if cur else None
+        if cur is None:
+            return
+        ch: Optional[ChangeOut] = cur.data(0, Qt.UserRole)
         if ch is None:
+            key = cur.data(0, Qt.UserRole + 1)
+            if key is None:
+                return
+            kids = [cur.child(i).data(0, Qt.UserRole) for i in range(cur.childCount())]
+            self.path.setText(f"{key} — {len(kids)} modifiche")
+            lb, la = self._labels()
+            self.diff.set_diff("\n".join(f"// {k.path.rsplit('/', 1)[-1]}\n{k.base_text}" for k in kids),
+                               "\n".join(f"// {k.path.rsplit('/', 1)[-1]}\n{k.new_text}" for k in kids), lb, la)
             return
         self.path.setText(ch.path)
-        self.diff.set_diff(ch.base_text, ch.new_text, "Base", f"Dopo ({ORIGIN_IT[ch.origin]})")
+        lb, la = self._labels()
+        self.diff.set_diff(ch.base_text, ch.new_text, lb, f"{la} ({ORIGIN_IT[ch.origin]})" if la == "Dopo" else la)
 
 
 # ======================================================================================= conflitti

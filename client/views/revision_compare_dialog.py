@@ -29,16 +29,18 @@ class CompareBrowser(ChangeBrowser):
 
     def show_changes(self, changes: list[ChangeOut]) -> None:
         self.set_changes(f"rev {self.from_rev} → rev {self.to_rev}", changes, [])
-        top, second = self.tree.topLevelItem(0), self.tree.topLevelItem(1)
-        top.setText(0, f"Differenze da rev {self.from_rev} a rev {self.to_rev} ({len(changes)})")
-        second.setHidden(True)
 
-    def _selected(self, cur: Optional[QTreeWidgetItem], _prev=None) -> None:     # noqa: ANN001
-        ch: Optional[ChangeOut] = cur.data(0, Qt.UserRole) if cur else None
-        if ch is None:
-            return
-        self.path.setText(ch.path)
-        self.diff.set_diff(ch.base_text, ch.new_text, f"rev {self.from_rev}", f"rev {self.to_rev}")
+    def titles(self, n_mine: int, n_up: int) -> tuple[str, str]:
+        return f"Differenze da rev {self.from_rev} a rev {self.to_rev} ({n_mine})", ""
+
+    def _rebuild(self) -> None:
+        super()._rebuild()
+        second = self.tree.topLevelItem(1)
+        if second is not None:
+            second.setHidden(True)
+
+    def _labels(self) -> tuple[str, str]:
+        return f"rev {self.from_rev}", f"rev {self.to_rev}"
 
 
 def _rev_line(m: MasterInfo) -> str:

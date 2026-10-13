@@ -141,6 +141,10 @@ class FakeServer:
             return ok(proposal("p-req"))
         if path in (f"{base}/proposals", f"{base}/developers", f"{base}/permissions"):
             return ok([])
+        if path == f"{base}/presence":
+            return ok([{"username": "anna", "role": "Developer", "online": True, "contexts": [
+                {"branch": "", "branch_name": "Master", "revision": 3, "online": True, "holds_lock": True},
+                {"branch": "mio", "branch_name": "mio", "revision": 2, "online": False, "holds_lock": False}]}])
         if path == f"{base}/lock":
             return ok({"locked": False})
         return httpx.Response(404, json={"detail": f"non gestito: {req.method} {path}"})
@@ -293,9 +297,12 @@ def test_switch_branch_sets_api_branch_resubscribes_ws_and_reloads(qapp, tmp_pat
     assert len(win.ws.urls) == n_ws + 1 and win.ws.urls[-1].endswith("&project=1&branch=mio")
     assert not dlg.isVisible() and srv.last("GET", "/master")[2] == {"branch": "mio"}       # finestre chiuse, dati del branch
     after = srv.calls[n_calls:]
-    for suffix in ("/master", "/proposals", "/developers", "/lock"):                      # ricaricati TUTTI sul branch
+    for suffix in ("/master", "/proposals", "/lock"):                      # ricaricati TUTTI sul branch
         hits = [c for c in after if c[0] == "GET" and c[1].endswith(suffix)]
         assert hits and all(c[2].get("branch") == "mio" for c in hits), suffix
+    assert any(c[0] == "GET" and c[1].endswith("/presence") and "branch" not in c[2] for c in after)   # presenza: sempre globale
+    texts = [l.text() for l in win.dashboard.findChildren(type(win.dashboard.lbl_master), "presence_ctx")]
+    assert any("Master · rev 3" in t and "in carico" in t for t in texts) and any("mio · rev 2" in t for t in texts)
     assert "Branch «mio» rev 4" in win.dashboard.lbl_master.text()
     assert not win.dashboard.branch_bar.isHidden() and "branch «mio»" in win.dashboard.lbl_branch.text()
     assert "Linea 1" in win.dashboard.title.text() and "mio" in win.dashboard.title.text()

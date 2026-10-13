@@ -188,3 +188,73 @@ def test_live_client_update_offer_download_and_apply(blive, qapp, tmp_path, monk
     assert _lapi(live, "dev1").client_update("9.9").available is False
     win.ws.stop()
     win.close()
+
+
+def test_change_browser_filter_and_group_by_routine(qapp):
+    from client.gui_approval import ChangeBrowser, group_key
+    from common.schemas import ChangeOut
+
+    def ch(path, kind="modified", origin="proposal", b="a", n="b"):
+        return ChangeOut(path=path, title=path, label="Rung", kind=kind, origin=origin, base_text=b, new_text=n)
+
+    assert group_key("Program[Main]/Routine[R01]/Rung#3") == "Program[Main]/Routine[R01]"
+    assert group_key("Tag[Motor]") == "(elementi globali)"
+    mine = [ch("Program[Main]/Routine[R01]/Rung#1", b="XIC(a)", n="XIC(b)"),
+            ch("Program[Main]/Routine[R01]/Rung#2", b="OTE(x)", n="OTE(y)"),
+            ch("Program[Main]/Routine[R02]/Rung#1"), ch("Tag[Motor]", "added")]
+    br = ChangeBrowser()
+    br.set_changes("anna", mine, [ch("Program[Aux]/Routine[Z]/Rung#0", origin="master")])
+    assert br.tree.topLevelItem(0).childCount() == 4 and br.tree.currentItem().data(0, 256) is not None   # piatto
+    br.filter.setText("r01")
+    assert br.tree.topLevelItem(0).childCount() == 2 and "(2)" in br.tree.topLevelItem(0).text(0)
+    assert br.tree.topLevelItem(1).childCount() == 0 and br.lbl_count.text() == "2 di 5"
+    br.filter.setText("")
+    br.chk_group.setChecked(True)
+    top = br.tree.topLevelItem(0)
+    assert [top.child(i).text(0) for i in range(top.childCount())] == [
+        "Program[Main]/Routine[R01] (2)", "Program[Main]/Routine[R02] (1)", "(elementi globali) (1)"]
+    br.tree.setCurrentItem(top.child(0))                                      # il gruppo mostra l'intera routine
+    assert "2 modifiche" in br.path.text()
+    assert "XIC(a)" in br.diff.left.toPlainText() and "OTE(y)" in br.diff.right.toPlainText() \
+        if hasattr(br.diff, "left") else True
+    br.tree.setCurrentItem(top.child(0).child(0))
+    assert br.path.text().endswith("Rung#1")
+
+
+@needs_server
+def test_live_quick_reply_from_notifications(blive, qapp, tmp_path, monkeypatch):
+    from client.views.notifications_dialog import NotificationsDialog
+    live = blive
+    warns = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warns.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: warns.append(a[2]))
+    a1, a2 = _lapi(live, "dev1"), _lapi(live, "dev2")
+    f = tmp_path / "Imp.txt"
+    f.write_text(TEXT.replace("riga 6", "riga 6 RISPOSTA RAPIDA"), "utf-8")
+    d = a1.submit_proposal(f, a1.master_info().revision, "da notifica")
+    dlg = NotificationsDialog(a2, run=sync)
+    row = next(i for i, n in enumerate(dlg._rows) if n.ref == d.id)
+    dlg.table.selectRow(row)
+    assert dlg.btn_approve.isEnabled() and dlg.btn_reject.isEnabled()
+    seen = []
+    dlg.unread_changed.connect(seen.append)
+    asked = []
+    dlg.ask_comment = lambda text: asked.append(text) or None                   # rifiuto annullato: nulla accade
+    dlg.decide(False)
+    before = a2.proposal(d.id)
+    assert not any(p.decision == "reject" for p in before.participants)
+    dlg.ask_confirm = lambda text: False                                        # approvazione non confermata
+    dlg.decide(True)
+    assert not any(p.decision == "approve" for p in a2.proposal(d.id).participants if p.session_id == a2.session_key)
+    summaries = []
+    dlg.ask_confirm = lambda text: summaries.append(text) or True
+    dlg.decide(True)                                                           # confermata: il voto arriva al server
+    assert summaries and "dev1" in summaries[0] and "modifiche" in summaries[0]
+    after = a2.proposal(d.id)
+    mine = next((p for p in after.participants if p.session_id == a2.session_key), None)
+    assert (mine is not None and mine.decision == "approve") or after.state.value.lower().startswith("merged")
+    assert seen and a2.notifications_unread() == seen[-1] and not warns
+    try:
+        a1.cancel(d.id)
+    except Exception:
+        pass

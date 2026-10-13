@@ -5,9 +5,11 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton,
+                               QVBoxLayout, QWidget)
 
 from client.api_client import ApiClient, ApiError
+from client.gui_approval import OPEN_STATES, compute_permissions
 from client.theme.tokens import T
 from client.views.common import full_time, heading, item, make_table, muted
 from client.workers import run_async
@@ -45,17 +47,21 @@ class NotificationsDialog(QDialog):
         self.chk_unread = QCheckBox("Solo non lette")
         self.btn_open = QPushButton("Apri")
         self.btn_open.setProperty("variant", "primary")
+        self.btn_approve = QPushButton("Approva")
+        self.btn_reject = QPushButton("Rifiuta...")
         self.btn_read = QPushButton("Segna come letta")
         self.btn_all = QPushButton("Segna tutte come lette")
         self.btn_reload = QPushButton("Aggiorna")
         self.btn_close = QPushButton("Chiudi")
-        for w in (self.chk_unread, self.btn_open, self.btn_read, self.btn_all, self.btn_reload):
+        for w in (self.chk_unread, self.btn_open, self.btn_approve, self.btn_reject, self.btn_read, self.btn_all, self.btn_reload):
             row.addWidget(w)
         row.addStretch(1)
         row.addWidget(self.btn_close)
         lay.addLayout(row)
         self.chk_unread.toggled.connect(lambda _on: self.reload())
         self.btn_open.clicked.connect(lambda _c=False: self.open_selected())
+        self.btn_approve.clicked.connect(lambda _c=False: self.decide(True))
+        self.btn_reject.clicked.connect(lambda _c=False: self.decide(False))
         self.btn_read.clicked.connect(lambda _c=False: self.mark_selected())
         self.btn_all.clicked.connect(lambda _c=False: self.mark_all())
         self.btn_reload.clicked.connect(lambda _c=False: self.reload())
@@ -98,6 +104,9 @@ class NotificationsDialog(QDialog):
     def _sel(self) -> None:
         n = self.selected()
         self.btn_open.setEnabled(n is not None and bool(n.ref or n.branch))
+        quick = n is not None and n.kind == "merge_request" and bool(n.ref) and bool(n.project_id) and not n.read
+        self.btn_approve.setEnabled(quick)
+        self.btn_reject.setEnabled(quick)
         self.btn_read.setEnabled(n is not None and not n.read)
         self.btn_all.setEnabled(any(not x.read for x in self._rows))
 
@@ -122,3 +131,48 @@ class NotificationsDialog(QDialog):
             self._run(lambda: self.api.mark_notifications_read([n.id]), lambda u: self.unread_changed.emit(u), self._err)
         self.accept()
         self.open_requested.emit(n)
+
+    # ------------------------------------------------------------------ risposta rapida
+    def ask_confirm(self, text: str) -> bool:
+        return QMessageBox.question(self, "Conferma", text) == QMessageBox.Yes
+
+    def ask_comment(self, text: str) -> Optional[str]:
+        msg, ok = QInputDialog.getMultiLineText(self, "Rifiuta richiesta", text)
+        return msg if ok else None
+
+    def decide(self, approve: bool) -> None:
+        """Approva / rifiuta la richiesta di merge della notifica selezionata senza aprire la finestra di consenso."""
+        n = self.selected()
+        if n is None or n.kind != "merge_request" or not n.ref or not n.project_id:
+            return
+        self._run(lambda: self.api.proposal_for(n.project_id, n.branch, n.ref),
+                  lambda d: self._decide_with(n, d, approve), self._err)
+
+    def _decide_with(self, n: NotificationOut, d, approve: bool) -> None:      # noqa: ANN001  (ProposalDetail)
+        if d.state not in OPEN_STATES:
+            QMessageBox.information(self, "Richiesta conclusa", f"La richiesta è già «{d.state_label}»: nulla da fare.")
+            self.reload()
+            return
+        perms = compute_permissions(d, self.api.session_key, self.api.role)
+        if not (perms.approve if approve else perms.reject):
+            QMessageBox.warning(self, "Non consentito", "Non puoi " + ("approvare" if approve else "rifiutare")
+                                + " questa richiesta (già votata, in conflitto o senza i permessi necessari). "
+                                  "Apri la richiesta per i dettagli.")
+            return
+        summary = (f"{d.author} · {d.n_changes} modifiche"
+                   + (f" · {d.n_conflicts} conflitti ({d.n_unresolved} da risolvere)" if d.n_conflicts else "")
+                   + (f"\n«{d.message}»" if d.message else ""))
+        comment = ""
+        if approve:
+            if not self.ask_confirm(f"Dare il consenso al merge?\n\n{summary}"):
+                return
+        else:
+            c = self.ask_comment(f"Motivo del rifiuto (richiesta di {summary}):")
+            if c is None:
+                return
+            comment = c
+        self._run(lambda: self.api.decide_for(n.project_id, n.branch, n.ref, approve, comment),
+                  lambda _d: self._decided(n), self._err)
+
+    def _decided(self, n: NotificationOut) -> None:
+        self._run(lambda: self.api.mark_notifications_read([n.id]), self._marked, self._err)
