@@ -10,8 +10,9 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCursor, QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+                               QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 from client.api_client import ApiError
 from client.theme import mono_font
@@ -23,7 +24,9 @@ from client.views.sidebar import Sidebar
 from client.views.user_mgmt_view import UserMgmtView
 from client.workers import run_async
 from common.roles import Role
+from server import tls as tlsmod
 from server.auth.security import generate_password
+from server.backup import default_backup_name
 from server.gui.controller import (DATA_SUBDIR, EmbeddedServer, check_writable, copy_data, has_data,
                                    resolve_data_dir)
 from server.gui.settings import ServerPrefs
@@ -217,6 +220,8 @@ class SettingsPage(QWidget):
     network_apply_requested = Signal(str, int, str)
     autostart_changed = Signal(bool)
     service_action = Signal(str)                      # install | start | stop | remove
+    backup_requested = Signal()
+    tls_generate_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -274,11 +279,84 @@ class SettingsPage(QWidget):
         nl.addLayout(r2)
         nl.addWidget(muted("Con \"Tutta la rete\" i client trovano il server da soli (UDP 8751) e si collegano alla porta "
                            "indicata: aprile nel firewall di Windows. La ricerca automatica funziona nella stessa rete "
-                           "locale (non attraverso router/VPN). Il traffico non e' cifrato: usare solo su reti fidate "
-                           "o dietro un proxy HTTPS."))
+                           "locale (non attraverso router/VPN). Senza HTTPS (sezione qui sotto) password e dati "
+                           "viaggiano in chiaro: usare solo su reti fidate."))
+
+        # ---- connessione sicura (HTTPS): certificato autofirmato generato qui oppure PEM dell'utente
+        nl.addSpacing(6)
+        nl.addWidget(_label("CONNESSIONE SICURA (HTTPS)"))
+        self.tls_on = QCheckBox("Usa HTTPS")
+        nl.addWidget(self.tls_on)
+        self.tls_mode_self = QRadioButton("Genera certificato autofirmato")
+        self.tls_mode_custom = QRadioButton("Usa un mio certificato (.pem/.crt + .key)...")
+        self.tls_mode_self.setChecked(True)
+        nl.addWidget(self.tls_mode_self)
+        gr = QHBoxLayout()
+        self.btn_tls_generate = QPushButton("Genera / rigenera certificato")
+        self.btn_tls_generate.setProperty("variant", "ghost")
+        self.btn_tls_generate.clicked.connect(self.tls_generate_requested)
+        gr.addSpacing(22)
+        gr.addWidget(self.btn_tls_generate)
+        gr.addStretch(1)
+        nl.addLayout(gr)
+        nl.addWidget(self.tls_mode_custom)
+        self.tls_cert, self.tls_key = QLineEdit(), QLineEdit()
+        self.tls_cert.setPlaceholderText("certificato (.pem / .crt)")
+        self.tls_key.setPlaceholderText("chiave privata (.key / .pem, senza password)")
+        self.btn_tls_cert, self.btn_tls_key = QPushButton("Sfoglia..."), QPushButton("Sfoglia...")
+        for edit, btn, title in ((self.tls_cert, self.btn_tls_cert, "Certificato"), (self.tls_key, self.btn_tls_key, "Chiave privata")):
+            row = QHBoxLayout()
+            row.addSpacing(22)
+            row.addWidget(edit, 1)
+            row.addWidget(btn)
+            nl.addLayout(row)
+            btn.clicked.connect(lambda _c=False, e=edit, t=title: self._browse_tls(e, t))
+        self.lbl_cert = QLabel("-")
+        self.lbl_cert.setProperty("mono", True)
+        self.lbl_cert.setWordWrap(True)
+        self.lbl_cert.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        nl.addWidget(self.lbl_cert)
+        self.lbl_tls_warn = QLabel("")
+        self.lbl_tls_warn.setWordWrap(True)
+        self.lbl_tls_warn.setStyleSheet(f"color:{T['ORANGE']};")
+        nl.addWidget(self.lbl_tls_warn)
+        nl.addWidget(muted("Con HTTPS il server ascolta solo in https:// / wss:// (nessun HTTP in chiaro). Con il certificato "
+                           "autofirmato i client mostrano l'impronta alla prima connessione e la ricordano; se rigeneri il "
+                           "certificato dovranno accettarlo di nuovo. Per un certificato aziendale scegli i file PEM."))
+        trow = QHBoxLayout()
+        self.btn_tls_apply = QPushButton("Applica e riavvia")
+        trow.addStretch(1)
+        trow.addWidget(self.btn_tls_apply)
+        nl.addLayout(trow)
+        self.btn_tls_apply.clicked.connect(lambda: self.btn_apply.click())
+        for w in (self.tls_on, self.tls_mode_self, self.tls_mode_custom):
+            w.toggled.connect(self._sync_tls)
+        self.host.currentIndexChanged.connect(self._sync_tls)
+        self._tls_info = ""
+        self._sync_tls()
+
         self.autostart = QCheckBox("Avvia il server automaticamente all'apertura dell'applicazione")
         nl.addWidget(self.autostart)
         lay.addWidget(net)
+
+        bk = QFrame()
+        bk.setObjectName("Panel")
+        kl = QVBoxLayout(bk)
+        kl.setContentsMargins(18, 14, 18, 14)
+        kl.setSpacing(8)
+        kl.addWidget(_label("BACKUP"))
+        kl.addWidget(muted("Crea un archivio .zip con database, utenti, progetti, revisioni e audit; si puo' fare anche a "
+                           "server acceso. L'archivio contiene i dati dei progetti e il segreto di firma dei token: "
+                           "conservalo in un posto protetto. Per ripristinarlo: ferma il server e scompatta l'archivio "
+                           "nella cartella dei dati."))
+        brow = QHBoxLayout()
+        self.btn_backup = QPushButton("  Crea backup...")
+        self.btn_backup.setIcon(icon("folder", T["TEXT"], 18))
+        self.btn_backup.clicked.connect(self.backup_requested)
+        brow.addWidget(self.btn_backup)
+        brow.addStretch(1)
+        kl.addLayout(brow)
+        lay.addWidget(bk)
 
         svc = QFrame()
         svc.setObjectName("Panel")
@@ -309,6 +387,42 @@ class SettingsPage(QWidget):
         lay.addStretch(1)
         self.btn_apply.clicked.connect(lambda: self.network_apply_requested.emit(self.host.currentData(), self.port.value(), self.name.text().strip()))
         self.autostart.toggled.connect(self.autostart_changed)
+
+    def _browse_tls(self, edit: QLineEdit, title: str) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, f"{title} (PEM)", edit.text(),
+                                              "Certificati e chiavi PEM (*.pem *.crt *.cer *.key);;Tutti i file (*)")
+        if path:
+            edit.setText(path)
+
+    def _sync_tls(self) -> None:
+        on = self.tls_on.isChecked()
+        custom = self.tls_mode_custom.isChecked()
+        for w in (self.tls_mode_self, self.tls_mode_custom):
+            w.setEnabled(on)
+        self.btn_tls_generate.setEnabled(on and not custom)
+        for w in (self.tls_cert, self.tls_key, self.btn_tls_cert, self.btn_tls_key):
+            w.setEnabled(on and custom)
+        warn = tlsmod.insecure_warning(self.host.currentData() or "", on)
+        self.lbl_tls_warn.setText(warn or "")
+        self.lbl_tls_warn.setVisible(bool(warn))
+
+    def tls_values(self) -> dict:
+        """Scelte della sezione HTTPS: ``enabled``, ``mode`` (self | custom), ``cert`` e ``key`` (percorsi PEM dell'utente)."""
+        return {"enabled": self.tls_on.isChecked(), "mode": "custom" if self.tls_mode_custom.isChecked() else "self",
+                "cert": self.tls_cert.text().strip(), "key": self.tls_key.text().strip()}
+
+    def load_tls(self, enabled: bool, mode: str, cert: str, key: str, info: str = "") -> None:
+        for w in (self.tls_on, self.tls_mode_self, self.tls_mode_custom):
+            w.blockSignals(True)
+        self.tls_on.setChecked(enabled)
+        (self.tls_mode_custom if mode == "custom" else self.tls_mode_self).setChecked(True)
+        for w in (self.tls_on, self.tls_mode_self, self.tls_mode_custom):
+            w.blockSignals(False)
+        self.tls_cert.setText(cert)
+        self.tls_key.setText(key)
+        self._tls_info = info
+        self.lbl_cert.setText(info or "Nessun certificato ancora: verra' creato all'attivazione di HTTPS.")
+        self._sync_tls()
 
     def set_service_status(self, st: str) -> None:
         text = {"running": ("Installato - in esecuzione", T["GREEN"]), "stopped": ("Installato - fermo", T["ORANGE"]),
@@ -363,6 +477,7 @@ class ServerWindow(QMainWindow):
             v = dlg.values()
             self.prefs.data_base, self.prefs.host, self.prefs.port = v["base"], v["host"], v["port"]
             self.prefs.autostart = v["autostart"]
+            self.prefs.tls_enabled, self.prefs.tls_mode = bool(v.get("tls")), "self"
             if v["admin_password"]:
                 self._pending_admin = (v["admin_user"], v["admin_password"])
         if not self._open_server():
@@ -374,9 +489,14 @@ class ServerWindow(QMainWindow):
     def _make_server(self, admin: Optional[tuple[str, str]] = None) -> EmbeddedServer:
         srv = self._factory(resolve_data_dir(self.prefs.data_base), self.prefs.host, self.prefs.port,
                             admin_user=admin[0] if admin else None, admin_password=admin[1] if admin else None,
-                            name=self.prefs.server_name)
+                            name=self.prefs.server_name, **self._tls_kwargs())
         srv.log.on_line = self.log_line.emit
         return srv
+
+    def _tls_kwargs(self) -> dict:
+        custom = self.prefs.tls_mode == "custom"
+        return {"tls_enabled": self.prefs.tls_enabled, "tls_certfile": self.prefs.tls_certfile if custom else "",
+                "tls_keyfile": self.prefs.tls_keyfile if custom else ""}
 
     def _open_server(self, admin: Optional[tuple[str, str]] = None) -> bool:
         admin = admin or self._pending_admin
@@ -438,8 +558,11 @@ class ServerWindow(QMainWindow):
         self.status.btn_open.clicked.connect(lambda: open_folder(self.server.data_dir))
         self.settings_page.btn_open.clicked.connect(lambda: open_folder(self.server.data_dir))
         self.settings_page.change_folder_requested.connect(self.change_data_folder)
-        self.settings_page.network_apply_requested.connect(self.apply_network)
+        self.settings_page.network_apply_requested.connect(
+            lambda h, p, n: self.apply_network(h, p, n, tls=self.settings_page.tls_values()))
+        self.settings_page.tls_generate_requested.connect(self.generate_certificate)
         self.settings_page.service_action.connect(self.service_action)
+        self.settings_page.backup_requested.connect(self.create_backup)
         self.settings_page.autostart_changed.connect(lambda v: setattr(self.prefs, "autostart", v))
         self.audit.query_requested.connect(self._audit_query)
         self.audit.verify_requested.connect(self._audit_verify)
@@ -471,7 +594,19 @@ class ServerWindow(QMainWindow):
                               service=self.service_active and not srv.running)
         self.sidebar.set_connection(state, f"{srv.host if srv.host != '0.0.0.0' else 'rete'}:{srv.port}")
         self.settings_page.load(str(srv.data_dir), srv.host, srv.port, self.prefs.autostart, self.prefs.server_name)
+        self._refresh_tls_panel()
+        if state == "online" and srv.insecure_warning:
+            self.statusBar().showMessage(srv.insecure_warning, 15000)
         self.setWindowTitle(f"Automation Project Server - {'in esecuzione' if state == 'online' else 'fermo'}")
+
+    def _refresh_tls_panel(self) -> None:
+        srv = self.server
+        if srv is None:
+            return
+        p = self.prefs
+        cert = p.tls_certfile if p.tls_mode == "custom" else ""
+        info = tlsmod.current_cert_info(srv.data_dir, cert)
+        self.settings_page.load_tls(p.tls_enabled, p.tls_mode, p.tls_certfile, p.tls_keyfile, info.summary() if info else "")
 
     # ================================================================ server
     def start_server(self, then: Optional[Callable[[], None]] = None) -> None:
@@ -538,15 +673,18 @@ class ServerWindow(QMainWindow):
         srv = self.server
         if srv is None or srv.console is None:
             return
-        url = None
+        url, pin = None, None
         if st == "running" and not srv.running:
             try:
                 cfg = ServiceConfig.load()
                 if Path(cfg.data_dir).resolve() == Path(srv.data_dir).resolve():
-                    url = f"http://127.0.0.1:{cfg.port}"
+                    url = f"{tlsmod.scheme_for(cfg.tls_enabled)}://127.0.0.1:{cfg.port}"
+                    if cfg.tls_enabled:                      # il servizio e' sul nostro stesso PC: se ne conosce l'impronta
+                        info = tlsmod.current_cert_info(cfg.data_dir, cfg.tls_certfile)
+                        pin = info.sha256 if info else None
             except (OSError, ValueError):
                 url = None
-        srv.console.use_remote(url)
+        srv.console.use_remote(url, pin)
         if (url is not None) != self.service_active:
             self.service_active = url is not None
             self._show_state()
@@ -569,6 +707,12 @@ class ServerWindow(QMainWindow):
                 return
             args = ["install", "--data-dir", str(srv.data_dir), "--host", srv.host, "--port", str(srv.port),
                     "--name", srv.name or self.prefs.server_name]
+            if srv.tls_enabled:                                  # le impostazioni TLS finiscono nel service.json; il certificato sta in <dati>/tls
+                args.append("--tls")
+                if srv.tls_certfile:
+                    args += ["--tls-cert", srv.tls_certfile, "--tls-key", srv.tls_keyfile or srv.tls_certfile]
+            else:
+                args.append("--no-tls")
             self.prefs.autostart = False
         elif action in ("start", "stop", "remove"):
             args = [action]
@@ -673,14 +817,61 @@ class ServerWindow(QMainWindow):
             self.start_server()
         return True
 
-    def apply_network(self, host: str, port: int, name: Optional[str] = None) -> None:
+    @staticmethod
+    def _choose_backup_path(parent: QWidget, default_name: str) -> str:
+        path, _ = QFileDialog.getSaveFileName(parent, "Crea backup dei dati del server", default_name, "Archivio zip (*.zip)")
+        return path
+
+    def create_backup(self, chooser: Optional[Callable[[QWidget, str], str]] = None) -> None:
+        """Chiede dove salvare il backup (``chooser`` iniettabile nei test) e lo crea in un thread."""
         srv = self.server
         if srv is None:
             return
+        path = (chooser or self._choose_backup_path)(self, default_backup_name())
+        if not path:
+            return
+        dest = Path(path if path.lower().endswith(".zip") else path + ".zip")
+        self.statusBar().showMessage("Creazione del backup in corso...")
+
+        def ok(res: Path) -> None:
+            size = res.stat().st_size / (1024 * 1024)
+            self.statusBar().showMessage(f"Backup creato: {res} ({size:.1f} MB). Contiene il segreto JWT: conservalo "
+                                         "in un posto protetto.", 15000)
+        self._run(lambda: srv.backup(dest), ok, self._backup_error)
+
+    def _backup_error(self, exc: Exception) -> None:
+        self.statusBar().showMessage("Backup non riuscito", 8000)
+        QMessageBox.warning(self, "Backup non riuscito", str(exc))
+
+    def apply_network(self, host: str, port: int, name: Optional[str] = None, tls: Optional[dict] = None) -> None:
+        """Applica rete e (se indicato) HTTPS: ``tls`` = ``{"enabled", "mode": "self"|"custom", "cert", "key"}``."""
+        srv = self.server
+        if srv is None:
+            return
+        if tls is not None and tls["enabled"] and tls["mode"] == "custom":     # un certificato errato non deve fermare un server funzionante
+            try:
+                if not tls["cert"]:
+                    raise tlsmod.TlsError("Indica il file del certificato (.pem/.crt) e quello della chiave privata (.key).")
+                tlsmod.validate_pair(tls["cert"], tls["key"] or None)
+            except tlsmod.TlsError as exc:
+                QMessageBox.warning(self, "Certificato non valido", str(exc))
+                return
         was_running = srv.running
         srv.stop()
         srv.host, srv.port = host, port
         self.prefs.host, self.prefs.port = host, port
+        if tls is not None:
+            changed = (srv.tls_enabled, srv.tls_certfile) != (tls["enabled"], tls["cert"] if tls["mode"] == "custom" else "")
+            self.prefs.tls_enabled, self.prefs.tls_mode = tls["enabled"], tls["mode"]
+            self.prefs.tls_certfile, self.prefs.tls_keyfile = tls["cert"], tls["key"]
+            kw = self._tls_kwargs()
+            srv.tls_enabled, srv.tls_certfile, srv.tls_keyfile = kw["tls_enabled"], kw["tls_certfile"], kw["tls_keyfile"]
+            if srv.app is not None:
+                s = srv.app.state.settings
+                s.tls_enabled, s.tls_certfile, s.tls_keyfile = srv.tls_enabled, srv.tls_certfile, srv.tls_keyfile
+                if changed:
+                    srv.app.state.audit.record("tls_settings_changed", "console", target="https" if srv.tls_enabled else "http",
+                                               details={"enabled": srv.tls_enabled, "custom_certificate": bool(srv.tls_certfile)})
         if name is not None:
             self.prefs.server_name = srv.name = name
             if srv.app is not None:
@@ -688,6 +879,30 @@ class ServerWindow(QMainWindow):
         self._show_state()
         if was_running:
             self.start_server()
+
+    def generate_certificate(self, confirm: Optional[Callable[[], bool]] = None) -> None:
+        """Crea (o rigenera) il certificato autofirmato in ``<dati>/tls``; chiede conferma se ne esiste gia' uno."""
+        srv = self.server
+        if srv is None:
+            return
+        cert, _key = tlsmod.default_paths(srv.data_dir)
+        if cert.exists():
+            ok = confirm() if confirm else QMessageBox.question(
+                self, "Rigenera il certificato",
+                "Esiste gia' un certificato. Se lo rigeneri, tutti i client che lo avevano accettato vedranno un "
+                "avviso di certificato CAMBIATO e dovranno rimuovere la fiducia salvata e accettare il nuovo.\n\n"
+                "Continuare?") == QMessageBox.Yes
+            if not ok:
+                return
+
+        def ok_(info: "tlsmod.CertInfo") -> None:
+            if srv.app is not None:
+                srv.app.state.audit.record("tls_certificate_generated", "console", target=tlsmod.CERT_NAME,
+                                           details={"sha256": info.sha256, "not_after": info.not_after.isoformat()})
+            self._refresh_tls_panel()
+            self.statusBar().showMessage("Certificato generato: premi «Applica e riavvia» per usarlo", 10000)
+        self._run(lambda: tlsmod.generate_self_signed(srv.data_dir), ok_,
+                  lambda e: QMessageBox.warning(self, "Certificato", f"Generazione non riuscita: {e}"))
 
     # ================================================================ chiusura
     def closeEvent(self, e) -> None:                                               # noqa: ANN001

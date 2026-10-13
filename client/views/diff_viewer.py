@@ -292,9 +292,11 @@ class DiffViewer(QWidget):
         self.stats.setProperty("muted", True)
         self.btn_side, self.btn_inline = QPushButton("Side by side"), QPushButton("Inline")
         grp = QButtonGroup(self)
-        for b, tip in ((self.btn_side, "Due colonne affiancate"), (self.btn_inline, "Diff unificato")):
+        for b, tip, pos in ((self.btn_side, "Due colonne affiancate", "left"), (self.btn_inline, "Diff unificato", "right")):
             b.setCheckable(True)
             b.setProperty("seg", True)
+            b.setProperty("segpos", pos)
+            b.setCursor(Qt.PointingHandCursor)
             b.setToolTip(tip)
             grp.addButton(b)
         self.btn_side.setChecked(True)

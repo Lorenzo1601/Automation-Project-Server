@@ -9,9 +9,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Mapping, Optional
 
-from common.filekinds import L5K, L5X, detect_kind, rev_filename
+from common.filekinds import DEFAULT_NAME, L5K, L5X, PLCOPEN, detect_kind, rev_filename
 
 DEFAULT_EXT = ".L5X"
 MASTER_COPY = "Master" + DEFAULT_EXT              # copia del Master al momento del checkout (riferimento 'pulito')
@@ -35,6 +35,22 @@ def slug(text: str) -> str:
 def default_workdir(workspace: "str | Path", username: str, project_slug: str) -> Path:
     """Cartella proposta se l'utente non ne ha scelta una: ``<workspace>/<utente>/<progetto>``."""
     return Path(workspace) / slug(username) / slug(project_slug)
+
+
+BRANCHES_DIR = "branches"      # sotto la cartella del progetto: <cartella>/branches/<slug>/ (ognuna con il proprio .aps)
+
+
+def branch_dirname(branch_slug: str) -> str:
+    """Nome sicuro (una sola componente di percorso) della cartella di un branch."""
+    return re.sub(r"[^\w.-]+", "_", str(branch_slug or "")).strip("._") or "branch"
+
+
+def branch_folder(folder: "str | Path", branch_slug: "str | None") -> Path:
+    """Cartella locale di un branch: ``<cartella del progetto>/branches/<slug>``; senza branch (principale) e' la
+    cartella del progetto stessa, quindi il layout del principale resta invariato."""
+    if not branch_slug:
+        return Path(folder)
+    return Path(folder) / BRANCHES_DIR / branch_dirname(branch_slug)
 
 
 @dataclass
@@ -78,8 +94,8 @@ def looks_like_l5x(path: Path) -> bool:
 
 
 def looks_like_kind(path: Path, kind: str) -> bool:
-    """Il file e' del tipo atteso? Per L5X / L5K si controlla il contenuto; per ogni altro tipo vale qualsiasi file."""
-    if kind not in (L5X, L5K):
+    """Il file e' del tipo atteso? Per L5X / L5K / PLCopen si controlla il contenuto; per ogni altro tipo vale qualsiasi file."""
+    if kind not in (L5X, L5K, PLCOPEN):
         return _head(path, 1) is not None
     head = _head(path)
     return head is not None and detect_kind(head) == kind
@@ -141,6 +157,8 @@ def find_merge_candidates(folder: "str | Path", working_file: str = "", max_dept
             return
         for p in entries:
             if p.is_dir():
+                if depth == 0 and p.name == BRANCHES_DIR:
+                    continue                                        # i file dei branch non sono candidati al merge del principale
                 if depth < max_depth and p.name not in _SKIP_DIRS and not p.name.startswith("."):
                     walk(p, depth + 1)
                 continue
@@ -198,3 +216,124 @@ def pick_default(cands: list[Candidate]) -> Optional[Candidate]:
         if c.modified and c.looks_ok:
             return c
     return cands[0] if cands else None
+
+
+# ------------------------------------------------------------------ pulizia delle vecchie revisioni sul PC
+def _same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return a.stat().st_size == b.stat().st_size and _sha(a) == _sha(b)
+    except OSError:
+        return False
+
+
+def _revisions_in(directory: Path, pattern: "re.Pattern[str]") -> dict[int, Path]:
+    """File regolari (mai collegamenti simbolici) di ``directory`` il cui nome rispetta ESATTAMENTE il pattern."""
+    out: dict[int, Path] = {}
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return out
+    for p in entries:
+        m = pattern.fullmatch(p.name)
+        if m is None:
+            continue
+        try:
+            if p.is_symlink() or not p.is_file():
+                continue
+        except OSError:
+            continue
+        out[int(m.group(1))] = p
+    return out
+
+
+def prune_local(folder: "str | Path", name: str, ext: str, keep: int, protect_paths: "Iterable[str | Path]" = (),
+                known_sha: Optional["Mapping[int, str]"] = None) -> list[Path]:
+    """Tiene sul PC solo le ``keep`` revisioni piu' recenti del Master scaricate in ``folder``.
+
+    Considera i file ``<name>_revN<ext>`` direttamente in ``folder`` e le copie di riferimento omonime in ``.aps``;
+    le revisioni oltre le ``keep`` piu' alte (per numero) vengono rimosse. Ritorna i file cancellati.
+
+    REGOLE DI SICUREZZA (nel dubbio non si cancella nulla):
+      * mai un file (ne' la copia ``.aps``) di una revisione che compare in ``protect_paths`` (file di lavoro corrente,
+        sua base): basta che un percorso protetto abbia il nome ``<name>_revN<ext>`` per proteggere la revisione N;
+      * un file visibile si cancella solo se e' IDENTICO byte per byte alla propria copia pulita in ``.aps`` (o, in
+        assenza della copia, all'hash noto in ``known_sha[N]``): se e' diverso potrebbe contenere lavoro dell'utente,
+        se non si puo' verificare non si tocca; in entrambi i casi resta anche la copia di riferimento;
+      * solo nomi che rispettano esattamente ``<name>_rev<numero><ext>`` (numero senza zeri iniziali), solo file
+        regolari, mai collegamenti simbolici, mai nulla fuori da ``folder`` / ``folder/.aps``;
+      * ``keep`` < 1 o cartella inesistente: non fa nulla; ogni errore di I/O lascia il file dov'e'.
+    """
+    removed: list[Path] = []
+    try:
+        keep = int(keep)
+    except (TypeError, ValueError):
+        return removed
+    root = Path(folder)
+    if keep < 1 or not root.is_dir():
+        return removed
+    try:
+        root_r = root.resolve()
+        ref_dir = root / REF_DIR
+        ref_dir_r = ref_dir.resolve() if ref_dir.is_dir() else None
+    except OSError:
+        return removed
+    ext = norm_ext(ext)
+    pat = re.compile(rf"{re.escape(name or DEFAULT_NAME)}_rev([1-9][0-9]*){re.escape(ext)}")
+
+    protected_revs: set[int] = set()
+    protected_paths: set[Path] = set()
+    for p in protect_paths or ():
+        if not p:
+            continue
+        pp = Path(p)
+        try:
+            protected_paths.add(pp.resolve())
+        except OSError:
+            pass
+        m = pat.fullmatch(pp.name)
+        if m:
+            protected_revs.add(int(m.group(1)))
+
+    visible = _revisions_in(root, pat)
+    refs = _revisions_in(ref_dir, pat) if ref_dir_r is not None else {}
+    revs = sorted(set(visible) | set(refs), reverse=True)
+
+    def inside(p: Path, parent: Path) -> bool:
+        try:
+            return p.resolve().parent == parent
+        except OSError:
+            return False
+
+    def remove(p: Path) -> bool:
+        try:
+            if p.resolve() in protected_paths:
+                return False
+            p.unlink()
+        except OSError:
+            return False
+        removed.append(p)
+        return True
+
+    for rev in revs[keep:]:
+        if rev in protected_revs:
+            continue
+        v, r = visible.get(rev), refs.get(rev)
+        if r is not None and ref_dir_r is not None and not inside(r, ref_dir_r):
+            r = None
+        if v is not None:
+            if not inside(v, root_r):
+                continue
+            if r is not None:
+                clean = _same_bytes(v, r)
+            elif known_sha and rev in known_sha:
+                try:
+                    clean = _sha(v) == known_sha[rev]
+                except OSError:
+                    clean = False
+            else:
+                clean = False                                      # non verificabile -> non si cancella
+            if not clean or not remove(v):
+                continue                                           # modificato / protetto / errore: resta tutto
+        if r is not None:
+            remove(r)
+    return removed

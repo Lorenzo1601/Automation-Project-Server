@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QEasingCurve, QRectF, QSize, Qt, QVariantAnimation
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
+from PySide6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from client.theme.tokens import T
 from common.schemas import ProposalState
@@ -39,6 +39,14 @@ _ICONS = {
     "server": '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>',
     "copy": '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     "lock": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    "help": '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    "inbox": '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+    "search": '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+    "info": '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>',
+    "book": '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+    "zap": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+    "list": '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+    "wifi": '<path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>',
 }
 
 
@@ -74,6 +82,29 @@ def icon(name: str, color: str = T["MUTED"], size: int = 20) -> QIcon:
         pm.setDevicePixelRatio(2)
         out.addPixmap(pm, mode)
     return out
+
+
+def icon_pixmap(name: str, color: str = T["MUTED"], size: int = 20) -> QPixmap:
+    """Pixmap nitida (device pixel ratio 2) di un'icona: per QLabel / disegno personalizzato."""
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" '
+           f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{_ICONS[name]}</svg>')
+    pm = QPixmap(size * 2, size * 2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    QSvgRenderer(svg.encode()).render(p, QRectF(0, 0, size * 2, size * 2))
+    p.end()
+    pm.setDevicePixelRatio(2)
+    return pm
+
+
+def add_shadow(w: QWidget, blur: int = 36, dy: int = 10, alpha: int = 150) -> QGraphicsDropShadowEffect:
+    """Ombra morbida (usare con parsimonia: scheda di login, finestre flottanti)."""
+    fx = QGraphicsDropShadowEffect(w)
+    fx.setBlurRadius(blur)
+    fx.setOffset(0, dy)
+    fx.setColor(QColor(0, 0, 0, alpha))
+    w.setGraphicsEffect(fx)
+    return fx
 
 
 # --------------------------------------------------------------------------------- LED di stato
@@ -128,15 +159,20 @@ class StatusLed(QWidget):
 # --------------------------------------------------------------------------------- badge di stato animato
 _BADGES = {
     # chiave: (testo, colore, pulse)
-    "pending": ("Pending Approval", T["ORANGE"], True),
-    "lead": ("Awaiting Lead", T["ORANGE"], True),
-    "conflict": ("Conflict Detected", T["RED"], True),
-    "approved": ("Approved", T["GREEN"], False),
-    "merged": ("Merged", T["ACCENT"], False),
-    "rejected": ("Rejected", T["RED"], False),
-    "cancelled": ("Cancelled", T["MUTED"], False),
-    "forced": ("Force Merged", T["ORANGE"], False),
+    "pending": ("In attesa di consensi", T["ORANGE"], True),
+    "lead": ("Attende il Lead", T["ORANGE"], True),
+    "conflict": ("Conflitti da risolvere", T["RED"], True),
+    "approved": ("Approvata", T["GREEN"], False),
+    "merged": ("Unita al Master", T["ACCENT"], False),
+    "rejected": ("Rifiutata", T["RED"], False),
+    "cancelled": ("Annullata", T["MUTED"], False),
+    "forced": ("Merge forzato", T["ORANGE"], False),
 }
+
+
+def badge_color(kind: str) -> str:
+    """Colore di stato di una richiesta (barra laterale delle schede, badge)."""
+    return _BADGES[kind][1]
 
 
 def badge_kind(state: ProposalState, needs_lead_pending: bool = False, forced: bool = False) -> str:
@@ -239,7 +275,11 @@ class Avatar(QWidget):
         inset = 2.0 if self._ring else 0.5
         r = QRectF(inset, inset, self._size - 2 * inset, self._size - 2 * inset)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(avatar_color(self._name)))
+        base = QColor(avatar_color(self._name))
+        g = QLinearGradient(r.topLeft(), r.bottomRight())
+        g.setColorAt(0.0, base.lighter(118))
+        g.setColorAt(1.0, base.darker(112))
+        p.setBrush(g)
         p.drawEllipse(r)
         if self._ring:
             pen = QPen(QColor(self._ring))
@@ -257,3 +297,126 @@ class Avatar(QWidget):
 
 def role_color(role_key: str) -> str:
     return {"Admin": T["RED"], "Lead_Engineer": T["ORANGE"], "Developer": T["ACCENT"], "Viewer": T["MUTED"]}.get(role_key, T["MUTED"])
+
+
+
+# --------------------------------------------------------------------------------- stato vuoto
+class EmptyState(QFrame):
+    """Segnaposto per aree senza contenuto: icona in un cerchio, titolo e testo esplicativo."""
+
+    def __init__(self, ico: str = "inbox", title: str = "", text: str = "", parent: Optional[QWidget] = None,
+                 dashed: bool = True, compact: bool = False):
+        super().__init__(parent)
+        self.setObjectName("EmptyState" if dashed else "EmptyPlain")
+        self._ico = ico
+        lay = QVBoxLayout(self)
+        pad = 16 if compact else 32
+        lay.setContentsMargins(pad, pad, pad, pad)
+        lay.setSpacing(6)
+        lay.addStretch(1)
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(56, 56)
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        self.icon_label.setPixmap(icon_pixmap(ico, T["ACCENT"], 26))
+        self.icon_label.setStyleSheet("background-color: rgba(0,229,255,24); border-radius: 28px;")
+        self.title = QLabel(title)
+        self.title.setProperty("h3", True)
+        self.title.setAlignment(Qt.AlignCenter)
+        self.text = QLabel(text)
+        self.text.setProperty("muted", True)
+        self.text.setWordWrap(True)
+        self.text.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.icon_label, 0, Qt.AlignHCenter)
+        lay.addSpacing(6)
+        lay.addWidget(self.title)
+        lay.addWidget(self.text)
+        lay.addStretch(1)
+        self.title.setVisible(bool(title))
+        self.text.setVisible(bool(text))
+        self.setMinimumHeight(150 if compact else 220)
+
+    def set_texts(self, title: str, text: str = "") -> None:
+        self.title.setText(title)
+        self.text.setText(text)
+        self.title.setVisible(bool(title))
+        self.text.setVisible(bool(text))
+
+
+# --------------------------------------------------------------------------------- sfondo "hero" del login
+class HeroPanel(QFrame):
+    """Pannello di marca: gradiente scuro con motivo geometrico disegnato (schema a contatti / rami di merge)."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("Hero")
+
+    def paintEvent(self, _e) -> None:                            # noqa: ANN001
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        g = QLinearGradient(0, 0, w, h)
+        g.setColorAt(0.0, QColor("#1B2128"))
+        g.setColorAt(0.55, QColor("#161A20"))
+        g.setColorAt(1.0, QColor("#0F1317"))
+        p.fillRect(self.rect(), g)
+        # alone accento in alto a destra
+        rg = QRadialGradient(w * 0.92, h * 0.06, max(w, h) * 0.62)
+        rg.setColorAt(0.0, QColor(0, 229, 255, 46))
+        rg.setColorAt(1.0, QColor(0, 229, 255, 0))
+        p.fillRect(self.rect(), rg)
+        rg2 = QRadialGradient(w * 0.05, h * 1.0, max(w, h) * 0.55)
+        rg2.setColorAt(0.0, QColor(0, 122, 204, 40))
+        rg2.setColorAt(1.0, QColor(0, 122, 204, 0))
+        p.fillRect(self.rect(), rg2)
+        # griglia di punti
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 14))
+        step = 28
+        for x in range(step // 2, w, step):
+            for y in range(step // 2, h, step):
+                p.drawEllipse(QRectF(x - 1, y - 1, 2, 2))
+        # motivo: due "binari" verticali con pioli di logica ladder e rami che si fondono
+        rail = QPen(QColor(0, 229, 255, 34))
+        rail.setWidthF(2)
+        p.setPen(rail)
+        x1, x2 = w * 0.62, w * 0.94
+        p.drawLine(int(x1), int(h * 0.30), int(x1), int(h * 0.97))
+        p.drawLine(int(x2), int(h * 0.30), int(x2), int(h * 0.97))
+        rung = QPen(QColor(255, 255, 255, 22))
+        rung.setWidthF(1.5)
+        p.setPen(rung)
+        y = h * 0.38
+        i = 0
+        while y < h * 0.96:
+            p.drawLine(int(x1), int(y), int(x2), int(y))
+            # contatto (due trattini) a meta' piolo
+            mid = (x1 + x2) / 2 + (-18 if i % 2 else 12)
+            p.setPen(QPen(QColor(0, 229, 255, 70), 2))
+            p.drawLine(int(mid - 6), int(y - 7), int(mid - 6), int(y + 7))
+            p.drawLine(int(mid + 6), int(y - 7), int(mid + 6), int(y + 7))
+            p.setPen(rung)
+            y += 46
+            i += 1
+        # ramo che si fonde (curva di merge)
+        path_pen = QPen(QColor(0, 229, 255, 60))
+        path_pen.setWidthF(2.5)
+        p.setPen(path_pen)
+        p.setBrush(Qt.NoBrush)
+        from PySide6.QtGui import QPainterPath
+        path = QPainterPath()
+        path.moveTo(w * 0.70, h * 0.10)
+        path.cubicTo(w * 0.70, h * 0.22, w * 0.82, h * 0.18, w * 0.82, h * 0.30)
+        p.drawPath(path)
+        path2 = QPainterPath()
+        path2.moveTo(w * 0.94, h * 0.08)
+        path2.cubicTo(w * 0.94, h * 0.20, w * 0.82, h * 0.18, w * 0.82, h * 0.30)
+        p.drawPath(path2)
+        p.setPen(Qt.NoPen)
+        for cx, cy, col in ((w * 0.70, h * 0.10, QColor(255, 255, 255, 110)), (w * 0.94, h * 0.08, QColor(255, 171, 64, 160)),
+                            (w * 0.82, h * 0.30, QColor(0, 229, 255, 230))):
+            p.setBrush(col)
+            p.drawEllipse(QRectF(cx - 5, cy - 5, 10, 10))
+        halo = QColor(0, 229, 255, 40)
+        p.setBrush(halo)
+        p.drawEllipse(QRectF(w * 0.82 - 13, h * 0.30 - 13, 26, 26))
+        p.end()

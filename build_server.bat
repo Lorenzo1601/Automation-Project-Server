@@ -47,6 +47,8 @@ echo [4/4] Creazione eseguibile (puo' richiedere alcuni minuti)...
     --hidden-import multipart ^
     --hidden-import jwt ^
     --hidden-import bcrypt ^
+    --collect-submodules cryptography ^
+    --collect-data certifi ^
     --hidden-import starlette.testclient ^
     --hidden-import win32timezone ^
     --hidden-import servicemanager ^

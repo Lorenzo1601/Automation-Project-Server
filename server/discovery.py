@@ -13,8 +13,10 @@ log = logging.getLogger("aps.gui")
 
 
 class DiscoveryResponder:
-    def __init__(self, http_port: int, name: str, udp_port: int = DISCOVERY_PORT, bind: str = "") -> None:
+    def __init__(self, http_port: int, name: str, udp_port: int = DISCOVERY_PORT, bind: str = "",
+                 scheme: str = "http") -> None:
         self.http_port, self.name, self.udp_port, self.bind = http_port, name, udp_port, bind
+        self.scheme = scheme                       # "https" quando il server usa TLS: i client costruiscono l'URL giusto
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -57,7 +59,7 @@ class DiscoveryResponder:
                 break
             if data.strip() == PROBE:
                 try:
-                    self._sock.sendto(make_reply(self.name, self.http_port, self.sid), addr)
+                    self._sock.sendto(make_reply(self.name, self.http_port, self.sid, scheme=self.scheme), addr)
                 except OSError:
                     pass
 

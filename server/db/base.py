@@ -32,6 +32,24 @@ class Database:
     def create_all(self) -> None:
         from server.db import models  # noqa: F401  (registra le tabelle)
         Base.metadata.create_all(self.engine)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Migrazioni leggere: aggiunge le colonne introdotte dopo la creazione del database (SQLite e PostgreSQL)."""
+        from sqlalchemy import inspect, text
+        insp = inspect(self.engine)
+        if "projects" in insp.get_table_names() and "max_revisions" not in {c["name"] for c in insp.get_columns("projects")}:
+            with self.engine.begin() as cx:
+                cx.execute(text("ALTER TABLE projects ADD COLUMN max_revisions INTEGER NOT NULL DEFAULT 10"))
+        # branch: la tabella nuova la crea create_all; qui si aggiungono solo colonne introdotte dopo (database gia' esistenti)
+        if "branches" in insp.get_table_names():
+            cols = {c["name"] for c in insp.get_columns("branches")}
+            for col, ddl in (("sync_revision", "INTEGER NOT NULL DEFAULT 1"),
+                             ("parent", "VARCHAR(64) NOT NULL DEFAULT ''"),
+                             ("merged_main_revision", "INTEGER")):
+                if col not in cols:
+                    with self.engine.begin() as cx:
+                        cx.execute(text(f"ALTER TABLE branches ADD COLUMN {col} {ddl}"))
 
     def session(self) -> Session:
         return self._maker()

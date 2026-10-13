@@ -49,7 +49,7 @@ client/gui_approval.py     schermata Consenso + Diff + Conflitti      client/gui
 run_server.py / run_client.py   entry point per PyInstaller (run_server.py = exe unico del server: GUI, servizio, CLI)
 server/launcher.py         smista gli argomenti dell'exe unico: GUI | install/start/stop/... | serve | --run-service    build_server.bat / build_client.bat   creano gli exe
 client/api_client.py       client HTTP con refresh automatico del token   client/ws_listener.py  push
-tests/                     168 test (merger, tipi di file, nomi file, reimport, consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
+tests/                     409 test (merger, tipi di file, nomi file, reimport, consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
 samples/                   L5X di esempio: base, DevA, DevB (con e senza conflitti)
 ```
 
@@ -165,6 +165,7 @@ cercati da *Richiedi Merge* usano la stessa estensione e lo stesso nome; con **M
 |---|---|
 | **L5X** (XML Studio 5000) | strutturale: Rung / Line / Tag / UDT / AOI / Program / Routine |
 | **L5K** (ASCII Rockwell) | **testuale per riga** (3-way); le modifiche sono etichettate con `Program[X]/Routine[Y]`; controllo che sia lo stesso `CONTROLLER` |
+| **PLCopen XML** (CODESYS e simili) | strutturale: POU / DUT / variabili / azioni / transizioni / metodi / configurazioni; ST e IL per riga dentro la POU, LD/FBD/SFC atomici |
 | altro file di testo (`.st`, `.xml`, ...) | testuale per riga (3-way) |
 | file binario | nessun merge: il Master e' versionato, scaricabile e ripristinabile, le richieste di merge sono rifiutate |
 
@@ -227,6 +228,7 @@ python -m client
 | `APS_MAX_LOGIN_FAILURES` / `APS_LOCKOUT_SECONDS` | 5 / 300 | blocco temporaneo dopo password errate |
 | `APS_SESSION_TTL` | 90 | secondi senza heartbeat dopo cui un utente non è più "attivo" |
 | `APS_HOST` / `APS_PORT` / `APS_MAX_UPLOAD_MB` | `0.0.0.0` / 8750 / 200 | rete e limite upload |
+| `APS_DEFAULT_MAX_REVISIONS` | 10 | revisioni del Master conservate per i nuovi progetti (l'Admin la cambia per progetto, 2-200) |
 
 Prova rapida con gli esempi: due Developer e un Lead fanno Checkout; B invia `samples\DevB_con_conflitti.L5X` e viene
 approvata da B, A e dal Lead; poi A invia `samples\DevA.L5X` dalla stessa base e risolve i 2 conflitti dalla schermata.
@@ -272,7 +274,9 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
 | `GET /api/roles` | Viewer |
 | `GET/POST /api/users`, `PATCH /api/users/{id}` | Admin |
 | `GET /api/projects` | Viewer (solo quelli accessibili) |
-| `POST /api/projects`, `PATCH /api/projects/{id}`, `GET/PUT /api/projects/{id}/permissions` | Admin |
+| `POST /api/projects`, `PATCH /api/projects/{id}` (anche `max_revisions`), `GET/PUT /api/projects/{id}/permissions` | Admin |
+| `DELETE /api/projects/{id}?confirm=<nome esatto>` (elimina progetto, file e audit del progetto) | Admin |
+| `GET /api/projects/{id}/export` (.zip: revisioni conservate, history.json, audit.csv, README.txt) | Admin |
 | `POST /api/projects/{id}/master/init` | Lead |
 | `GET /api/projects/{id}/master` · `/master/history` · `/master/download` | Viewer |
 | `POST /api/projects/{id}/master/restore` | Admin |
@@ -287,6 +291,66 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
 (Gli ultimi path di progetto sono sotto `/api/projects/{id}/`.) Nel codice: `@require_role(Role.LEAD)` come decoratore,
 `min_role(Role.X)` come dipendenza FastAPI, `project_access(Role.X)` per il controllo per progetto.
 
+## Revisioni conservate, eliminazione, esportazione e backup
+
+* **Limite di revisioni** (`max_revisions`, predefinito 10, da 2 a 200, solo Admin): dopo ogni nuova revisione il server cancella
+  dal disco i file delle piu' vecchie, tenendo sempre la testa e le basi delle richieste di merge ancora attive. Nello storico
+  restano i metadati (`purged=true`). Una richiesta con base eliminata riceve 409 ("fai il Checkout dell'ultimo Master"); il
+  ripristino di una revisione eliminata e' rifiutato (422) e il download risponde 410. Ridurre il limite pota subito.
+* **Eliminazione di un progetto** (Admin, conferma con il nome esatto): cancella il progetto, la sua cartella dati e **tutte le sue
+  righe di audit**; la catena di hash viene ricalcolata (`AuditService.purge_project`, unica eccezione all'immutabilita') e
+  **non resta nessuna riga di audit** del progetto. L'unica memoria e' una riga nel registro applicativo del server (log).
+  I client collegati ricevono l'evento `project_deleted`.
+* **Esportazione** (`GET /api/projects/{id}/export`): archivio .zip con le revisioni conservate (`<nome>_revN<ext>`), `history.json`,
+  `audit.csv` e un `README.txt` che elenca le revisioni eliminate dal limite. Consigliata prima di eliminare un progetto.
+* **Backup dei dati del server**: dalla GUI (Impostazioni > BACKUP > "Crea backup...") oppure `python -m server --backup FILE.zip`.
+  Funziona a server acceso (il database e' copiato con l'API di backup di SQLite). L'archivio contiene database, progetti e il
+  **segreto JWT**: conservalo in un posto protetto. Ripristino a mano: server fermo, scompatta l'archivio nella cartella dati
+  (devono comparire `aps.db` e `projects/`), riavvia. Non copre un database PostgreSQL esterno (usa `pg_dump`).
+
+### Dal client e dalla console del server (Utenti & Permessi > Permessi di progetto, solo Admin)
+
+Gruppo **Impostazioni progetto**, identico nel client e nell'applicazione del server:
+**Modifica progetto...** (nome e descrizione), **Storico e rollback...** (scarica una revisione, "Ripristina come nuova
+revisione" con motivo; le revisioni eliminate dal limite sono in grigio e non si possono scaricare ne' ripristinare),
+**Esporta progetto (.zip)...**, **Revisioni da conservare sul server** + **Applica** (se riduci il limite chiede conferma:
+le revisioni piu' vecchie vengono eliminate in modo definitivo) ed **Elimina progetto...** (dialogo che elenca cosa sparira',
+propone l'esportazione preventiva e abilita il pulsante solo digitando il nome esatto). Quando un progetto viene eliminato i
+client collegati ricevono un avviso non bloccante e i loro **file locali non vengono toccati**.
+
+**Pulizia sul PC dei client**: dopo ogni download il client tiene al massimo le ultime N copie `<nome>_revN<ext>` (N = limite del
+progetto). Non cancella mai il file di lavoro, la sua base, file con contenuto diverso dalla propria copia pulita in `.aps`
+(potrebbero contenere lavoro tuo) ne' file che non rispettano esattamente il nome `<nome>_rev<numero><ext>`.
+
+## Guida integrata e aspetto
+
+Il client ha una **Guida** (voce di menu o tasto **F1**) con 20 argomenti in italiano e ricerca (ruoli, cartella locale, merge,
+consenso, conflitti, tipi di file, progetti, storico e rollback, revisioni conservate, eliminazione ed esportazione, audit,
+server, risoluzione dei problemi, scorciatoie). L'aspetto e' stato rifatto (tema condiviso con l'app del server): schermata di
+accesso a due colonne, schede a gradiente, sidebar a gruppi, tabelle e campi rifiniti, stati vuoti. Aggiungendo una funzione
+nuova ricordati di documentarla in `client/views/help_view.py` e, se genera un evento di audit, in `audit_view.ACTIONS`.
+
+## Novità: confronto, blocco, discussione, HTTPS, PLCopen, branch
+
+* **Confronto tra revisioni, etichette, blocco**: dallo storico si confrontano due revisioni (strutturale per L5X/PLCopen, per righe per il testo). Lead/Admin
+  etichettano e *bloccano* una revisione: le revisioni bloccate non vengono mai eliminate dal limite e non contano nel limite; sblocca solo l'Admin.
+* **Presa in carico (blocco esclusivo)** del Master (`lock.json` per progetto, scadenza 8 h, `APS_LOCK_TTL_H`); per i file binari c'è il *check-in*.
+  L'Admin può forzare il rilascio. Audit: `lock_acquired/released/forced`, `master_checkin`, `revision_labeled/locked/unlocked`.
+* **Discussione** sulle richieste di merge (scheda «Discussione»): commenti, `@menzioni`, modifica entro 15 minuti, eliminazione logica, eventi WS in tempo reale.
+  Audit: `comment_added/edited/deleted`.
+* **HTTPS integrato**: certificato autofirmato generato dal server (SAN con i nomi del PC, 825 giorni) o certificato/chiave PEM propri
+  (`--tls`, `--no-tls`, `--tls-cert`, `--tls-key`, Impostazioni del server). La ricerca automatica annuncia lo schema; il client
+  memorizza l'impronta SHA-256 al primo collegamento (*trust on first use*, file `trusted_servers.json`) e avvisa se cambia. Le notifiche usano `wss`.
+  Per un servizio Windows già installato, cambiare le impostazioni TLS richiede di reinstallarlo. Audit: `tls_certificate_generated`, `tls_settings_changed`. Richiede `cryptography`.
+* **PLCopen XML (CODESYS)**: merge strutturale (vedi tabella dei tipi). Il progetto deve avere lo stesso `contentHeader@name`; DOCTYPE/entità esterne sono rifiutati.
+* **Branch**: linee alternative del Master dentro un progetto, con revisioni, presa in carico, richieste di merge e commenti propri
+  (`data/projects/<progetto>/branches/<branch>/`). *Team* (Lead/Admin): richieste di merge e consenso normali. *Personale* (Developer o superiore, max 5 aperti
+  per utente e progetto): scrive solo il proprietario con salvataggi diretti (`POST .../branches/{slug}/commit`); le richieste nel branch hanno il solo consenso dell'autore.
+  «Aggiorna dal principale» (`/sync`) porta nel branch le novità con un 3-way; «Unisci nel principale» (`/merge`) crea una richiesta nel principale con consenso normale e a
+  merge fatto il branch diventa `merged` (sola lettura, come `closed`). Le basi dei branch aperti non sono eliminate dal limite di revisioni. Tutte le chiamate di progetto accettano `?branch=<slug>`, anche il WebSocket;
+  gli eventi portano `branch`. Export e backup includono i branch; eliminando il progetto spariscono anche i branch. Nel client: selettore nella barra laterale,
+  banner del branch, «Branch...», «Salva su branch...», cartelle locali `<cartella>/branches/<nome>/`. Audit: `branch_created/synced/merged/closed/deleted/committed`.
+
 ## Sicurezza e audit
 
 * Password con **bcrypt** (con pre-hash SHA-256), policy ≥ 10 caratteri con lettera e cifra, blocco temporaneo dopo 5 errori.
@@ -299,13 +363,14 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
 
 ## Limiti noti
 
-* **Branch non implementati**: la gestione di branch (Lead) e i branch personali (Developer) citati nelle specifiche non ci
-  sono; il modello è Master unico per progetto con richieste di merge. È un'estensione naturale (un `MasterStore` per branch).
 * Gli **exe** non includono i driver PostgreSQL (`APS_DATABASE_URL` funziona solo con SQLite); l'exe a file singolo
   può essere segnalato da alcuni antivirus/SmartScreen: in tal caso firmalo o aggiungi un'eccezione. Le build sono state
   provate su Linux con le stesse opzioni, non su Windows.
 * **LDAP / Active Directory non implementato**: solo account locali con bcrypt.
-* **Nessun TLS** integrato: in rete usare un reverse proxy HTTPS (le password viaggiano nel login).
+* **TLS** autofirmato: il client si fida al primo collegamento (impronta memorizzata); per una PKI aziendale usa un certificato proprio. Non provato su Windows (Schannel/servizio).
+* **PLCopen/CODESYS** provato su esempi sintetici e sul formato standard, non su export reali CODESYS (metodi, struttura del progetto).
+* Le **prese in carico** restano finché non scadono (8 h) o vengono rilasciate; le richieste di merge dei branch, come quelle del principale, non sono persistite al riavvio.
+* Race rarissima sulla creazione simultanea dello stesso nome di branch (500 invece di 409).
 * L'app grafica del server e' pensata per **una sola istanza per cartella dati**: non avviarne due sulla stessa cartella.
   Chiudendo la finestra il server si ferma (nessuna icona nell'area di notifica): per un servizio sempre attivo usa la
   versione console. La GUI del server non e' stata provata su Windows (solo su Linux in modalita' offscreen).
@@ -313,6 +378,8 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
   avvio/arresto, riavvio se cade, registro, scoperta) e' coperta da test e da un exe Linux, ma la registrazione presso il
   gestore dei servizi (pywin32, `sc`, `netsh`) va verificata alla prima installazione; in caso di problemi guarda
   `<cartella dati>\\logs\\server.log` e il Visualizzatore eventi.
+* Le revisioni piu' vecchie del limite sono **eliminate in modo definitivo** dal server: per tenerle, esporta il progetto o
+  alza il limite prima che vengano potate. Il backup (`--backup`) copia solo il database SQLite della cartella dati.
 * Le **richieste di merge in sospeso non sono persistite**: al riavvio del server vanno reinviate. Master, revisioni, utenti
   e audit invece sono su disco.
 * Il blocco dopo password errate è **in memoria** (si azzera al riavvio) e per singolo processo.

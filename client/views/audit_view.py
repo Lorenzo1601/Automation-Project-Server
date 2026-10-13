@@ -8,11 +8,11 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QVBoxLayout, QWidget)
+                               QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
 from client.theme.tokens import T
-from client.theme.widgets import icon
-from client.views.common import full_time, heading, item, make_table, muted
+from client.theme.widgets import EmptyState, icon
+from client.views.common import full_time, heading, item, make_table, subtitle, tint
 from common.roles import Role
 from common.schemas import AuditOut, AuditVerifyOut
 
@@ -25,13 +25,27 @@ ACTIONS = {
     "preview_downloaded": "Anteprima scaricata", "merge_requested": "Merge richiesto",
     "conflicts_resolved": "Conflitti risolti", "consent_given": "Consenso dato", "merge_rejected": "Merge rifiutato",
     "merge_cancelled": "Merge annullato", "merge_completed": "Merge completato", "merge_forced": "Merge forzato",
-    "master_restored": "Master ripristinato",
+    "master_restored": "Master ripristinato", "master_reimported": "File base reimportato",
+    "project_deleted": "Progetto eliminato", "retention_changed": "Limite revisioni modificato",
+    "revisions_pruned": "Revisioni eliminate dal limite", "project_exported": "Progetto esportato",
+    "backup_created": "Backup creato",
+    "tls_certificate_generated": "Certificato TLS generato", "tls_settings_changed": "Impostazioni TLS modificate",
+    "revision_labeled": "Revisione etichettata", "revision_locked": "Revisione bloccata",
+    "revision_unlocked": "Revisione sbloccata", "lock_acquired": "Presa in carico", "lock_released": "Rilascio presa in carico",
+    "lock_forced": "Presa in carico forzata", "master_checkin": "Check-in file",
+    "comment_added": "Commento aggiunto", "comment_edited": "Commento modificato", "comment_deleted": "Commento eliminato",
+    "branch_created": "Branch creato", "branch_synced": "Branch aggiornato dal principale", "branch_merged": "Branch unito",
+    "branch_closed": "Branch chiuso", "branch_deleted": "Branch eliminato", "branch_committed": "Salvataggio su branch",
     "console_session": "Console server", "permission_granted": "Permesso assegnato", "permission_revoked": "Permesso revocato",
 }
 ACTION_COLORS = {
     "merge_completed": T["GREEN"], "consent_given": T["GREEN"], "merge_requested": T["ACCENT"],
     "merge_rejected": T["RED"], "login_failed": T["RED"], "login_blocked": T["RED"], "token_reuse_detected": T["RED"],
     "merge_forced": T["ORANGE"], "master_restored": T["ORANGE"], "session_revoked": T["ORANGE"],
+    "master_reimported": T["ORANGE"], "revisions_pruned": T["ORANGE"], "retention_changed": T["ORANGE"],
+    "project_deleted": T["RED"], "project_exported": T["ACCENT"], "backup_created": T["ACCENT"],
+    "lock_forced": T["ORANGE"], "tls_settings_changed": T["ORANGE"], "branch_merged": T["GREEN"], "branch_deleted": T["ORANGE"],
+    "revision_locked": T["ACCENT"], "branch_created": T["ACCENT"],
 }
 HEADERS = ["Data", "Utente", "Azione", "Progetto", "Oggetto", "Dettagli", "Hash"]
 
@@ -64,11 +78,12 @@ class AuditView(QWidget):
         self._entries: list[AuditOut] = []
         self._projects: dict[int, str] = {}
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 24, 28, 20)
+        lay.setContentsMargins(32, 28, 32, 24)
         lay.setSpacing(12)
         lay.addWidget(heading("Cronologia eventi"))
-        lay.addWidget(muted("Registro immutabile: ogni voce è concatenata alla precedente con un hash SHA-256 e il "
-                            "database rifiuta modifiche e cancellazioni."))
+        lay.addWidget(subtitle("Registro immutabile: ogni voce è concatenata alla precedente con un hash SHA-256 e il "
+                               "database rifiuta modifiche e cancellazioni."))
+        lay.addSpacing(4)
 
         bar = QHBoxLayout()
         bar.setSpacing(8)
@@ -81,7 +96,8 @@ class AuditView(QWidget):
             self.action.addItem(v, k)
         self.actor = QLineEdit()
         self.actor.setPlaceholderText("Filtra per utente")
-        self.actor.setMaximumWidth(200)
+        self.actor.setMaximumWidth(220)
+        self.actor.addAction(icon("search", T["MUTED"], 16), QLineEdit.LeadingPosition)
         self.btn_refresh = QPushButton("  Aggiorna")
         self.btn_refresh.setIcon(icon("refresh", T["TEXT"], 18))
         self.btn_csv = QPushButton("  Esporta CSV")
@@ -109,7 +125,12 @@ class AuditView(QWidget):
         self.table.setColumnWidth(3, 190)
         self.table.setColumnWidth(4, 150)
         self.table.setColumnWidth(6, 90)
-        lay.addWidget(self.table, 1)
+        self.empty = EmptyState("audit", "Nessun evento da mostrare",
+                                "Non ci sono voci per i filtri scelti: prova con un altro progetto, azione o utente.")
+        self.body = QStackedWidget()
+        self.body.addWidget(self.table)
+        self.body.addWidget(self.empty)
+        lay.addWidget(self.body, 1)
         self.count = QLabel("")
         self.count.setProperty("muted", True)
         lay.addWidget(self.count)
@@ -159,8 +180,12 @@ class AuditView(QWidget):
             hi.setToolTip(f"#{e.id}\n{e.hash}")
             self.table.setItem(r, 6, hi)
         self.count.setText(f"{len(entries)} eventi")
+        self.body.setCurrentWidget(self.table if entries else self.empty)
 
     def set_verify_result(self, v: AuditVerifyOut) -> None:
+        col = T["GREEN"] if v.ok else T["RED"]
+        self.banner.setStyleSheet(f"background-color:{tint(col, 22)}; border:1px solid {tint(col, 90)}; "
+                                  "border-radius:8px; padding:10px 14px;")
         if v.ok:
             self.banner.setText(f"<span style='color:{T['GREEN']}; font-weight:700'>✔ Integrità verificata</span> "
                                 f"<span style='color:{T['MUTED']}'>— {v.checked} voci, catena di hash coerente.</span>")

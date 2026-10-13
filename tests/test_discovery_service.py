@@ -31,7 +31,7 @@ def free_port(udp=False) -> int:
 # ======================================================================================= protocollo
 def test_parse_reply_accepts_only_our_servers():
     ok = parse_reply(make_reply("Linea 1", 8750, "abc"))
-    assert ok == {"name": "Linea 1", "port": 8750, "version": "2.0", "id": "abc"}
+    assert ok == {"name": "Linea 1", "port": 8750, "version": "2.0", "id": "abc", "scheme": "http"}
     for junk in (b"", b"ciao", b"[]", b'{"app":"altro","port":1}', b'{"app":"AutomationProjectServer"}',
                  b'{"app":"AutomationProjectServer","port":0}', b'{"app":"AutomationProjectServer","port":"x"}',
                  b'{"app":"AutomationProjectServer","port":99999}', b"\xff\xfe"):

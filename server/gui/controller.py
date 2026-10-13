@@ -19,6 +19,8 @@ import uvicorn
 
 from client.api_client import ApiClient, ApiError
 from common.discovery import DISCOVERY_PORT
+from client import trust as _trust
+from server import tls as tlsmod
 from server.config import Settings
 from server.discovery import DiscoveryResponder
 from server.main import create_app
@@ -121,18 +123,36 @@ class ConsoleApi(ApiClient):
         self.remote_url: Optional[str] = None
         self.open()
 
-    def use_remote(self, url: Optional[str]) -> None:
+    def use_remote(self, url: Optional[str], pin: Optional[str] = None) -> None:
         """Instrada le chiamate a un server in esecuzione in un altro processo (servizio Windows) sugli stessi dati.
 
         Il token della console e' firmato con lo stesso segreto e la sessione sta nello stesso database, quindi il
         servizio lo accetta: cosi' creazione di progetti e inizializzazione del Master passano dal servizio e non
         lasciano la sua memoria disallineata dai file.
+
+        ``https://``: se si conosce l'impronta del certificato del servizio (``pin``, letta dalla cartella dati) la
+        connessione e' fissata a quella; senza pin la verifica e' disattivata SOLO se l'indirizzo e' il loopback
+        (stesso PC, il traffico non esce dalla macchina); altrimenti vale la verifica normale.
         """
-        if url == self.remote_url:
+        key = (url, pin)
+        if url == self.remote_url and key == getattr(self, "_remote_key", None):
             return
         import httpx
-        self.remote_url = url
-        self._http = httpx.Client(base_url=url, timeout=60.0) if url else self._inproc
+        self.remote_url, self._remote_key = url, key
+        self.base_url = (url or "http://console.local").rstrip("/")      # serve a riconoscere gli errori di certificato (schema)
+        if not url:
+            self._http = self._inproc
+            return
+        kw: dict = {}
+        if _trust.is_secure_url(url):
+            host, port = _trust.host_port(url)
+            if pin:
+                kw["verify"] = _trust.PinnedSSLContext(pin, host, port)
+            elif _trust.is_loopback(host):
+                kw["verify"] = False
+            else:
+                kw["verify"] = _trust.system_context()
+        self._http = httpx.Client(base_url=url, timeout=60.0, **kw)
 
     def open(self) -> None:
         self._store(self._app.state.auth.console_session())
@@ -172,7 +192,10 @@ class LogBuffer(logging.Handler):
 class EmbeddedServer:
     def __init__(self, data_dir: "str | Path", host: str = "0.0.0.0", port: int = 8750,
                  admin_user: Optional[str] = None, admin_password: Optional[str] = None, name: str = "",
-                 discovery_port: int = DISCOVERY_PORT, with_console: bool = True) -> None:
+                 discovery_port: int = DISCOVERY_PORT, with_console: bool = True, tls_enabled: bool = False,
+                 tls_certfile: str = "", tls_keyfile: str = "") -> None:
+        self.tls_enabled, self.tls_certfile, self.tls_keyfile = tls_enabled, tls_certfile, tls_keyfile
+        self.tls: Optional[tlsmod.TlsMaterial] = None            # certificato in uso (valido solo a server avviato)
         self.data_dir, self.host, self.port = Path(data_dir), host, port
         self.name, self.discovery_port, self.with_console = name, discovery_port, with_console
         self.discovery: Optional[DiscoveryResponder] = None
@@ -196,7 +219,8 @@ class EmbeddedServer:
         """Crea/apre database e cartelle nella cartella dati; prepara la console. Non mette il server in ascolto."""
         if self.app is not None:
             return
-        cfg = Settings(data_dir=self.data_dir, host=self.host, port=self.port, discovery_port=self.discovery_port)
+        cfg = Settings(data_dir=self.data_dir, host=self.host, port=self.port, discovery_port=self.discovery_port,
+                       tls_enabled=self.tls_enabled, tls_certfile=self.tls_certfile, tls_keyfile=self.tls_keyfile)
         if self.name:
             cfg.server_name = self.name
         if self._admin_user:
@@ -234,12 +258,21 @@ class EmbeddedServer:
     def starting(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and self._uv and not self._uv.started)
 
+    @property
+    def scheme(self) -> str:
+        return tlsmod.scheme_for(self.tls_enabled)
+
+    @property
+    def insecure_warning(self) -> Optional[str]:
+        """Avviso «connessione non cifrata» se il server e' esposto alla rete senza HTTPS."""
+        return tlsmod.insecure_warning(self.host, self.tls_enabled)
+
     def urls(self) -> list[str]:
         if self.host in ("0.0.0.0", ""):
             hosts = ["localhost", *local_addresses()]
         else:
             hosts = [self.host]
-        return [f"http://{h}:{self.port}" for h in hosts]
+        return [f"{self.scheme}://{h}:{self.port}" for h in hosts]
 
     def start(self, timeout: float = 15.0) -> bool:
         """Mette il server in ascolto. Ritorna True se e' partito; altrimenti ``last_error`` spiega il motivo."""
@@ -251,8 +284,29 @@ class EmbeddedServer:
             self.last_error = f"La porta {self.port} e' gia' in uso da un altro programma (o da un'altra istanza del server)."
             self._glog.error(self.last_error)
             return False
+        ssl_kw: dict = {}
+        if self.tls_enabled:                                  # con TLS attivo non si serve MAI HTTP in chiaro: se il certificato non va, non si parte
+            try:
+                self.tls = tlsmod.resolve_tls(self.data_dir, True, self.tls_certfile, self.tls_keyfile)
+            except tlsmod.TlsError as exc:
+                self.tls = None
+                self.last_error = f"HTTPS non attivabile: {exc}"
+                self._glog.error(self.last_error)
+                return False
+            if self.tls.generated:
+                self._glog.info("Generato un nuovo certificato autofirmato (%s): i client dovranno accettarlo", self.tls.certfile)
+            note = tlsmod.expiry_notice(self.tls.info)
+            if note:
+                self._glog.warning(note)
+            ssl_kw = {"ssl_certfile": self.tls.certfile}
+            if self.tls.keyfile != self.tls.certfile:
+                ssl_kw["ssl_keyfile"] = self.tls.keyfile
+        else:
+            self.tls = None
+            if self.insecure_warning:
+                self._glog.warning(self.insecure_warning)
         # log_config=None: negli eseguibili "windowed" sys.stderr e' None e la configurazione di uvicorn andrebbe in errore
-        cfg = uvicorn.Config(self.app, host=self.host, port=self.port, log_config=None, access_log=False)
+        cfg = uvicorn.Config(self.app, host=self.host, port=self.port, log_config=None, access_log=False, **ssl_kw)
         self._uv = uvicorn.Server(cfg)
 
         def run() -> None:
@@ -284,7 +338,8 @@ class EmbeddedServer:
         """Annuncia il server in rete (solo se in ascolto su un'interfaccia raggiungibile dagli altri PC)."""
         if self.host.startswith("127.") or self.discovery_port <= 0:
             return
-        self.discovery = DiscoveryResponder(self.port, self.app.state.settings.display_name, self.discovery_port)
+        self.discovery = DiscoveryResponder(self.port, self.app.state.settings.display_name, self.discovery_port,
+                                            scheme=self.scheme)
         self.discovery.start()
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -300,6 +355,25 @@ class EmbeddedServer:
             self._glog.info("Server fermato")
         self._uv = self._thread = None
         self.started_at = None
+
+    def backup(self, dest: "str | Path") -> Path:
+        """Crea uno .zip consistente dell'intera cartella dati (database, progetti, segreto JWT), anche a server acceso.
+
+        Il database viene copiato con l'API di backup di SQLite e, finche' dura la copia dei file, i progetti caricati
+        sono bloccati (nessun merge a meta' archivio). Il file contiene il segreto JWT: va conservato in un posto protetto
+        (vedi ``server.backup``). Registra ``backup_created`` nell'audit (attore ``console``). Ritorna il percorso creato.
+        """
+        import contextlib
+        from server.backup import create_backup
+        self.open()
+        with contextlib.ExitStack() as stack:
+            for rt in sorted(self.app.state.registry.runtimes(), key=lambda r: r.project_id):
+                stack.enter_context(rt.mgr._lock)                                    # noqa: SLF001
+            info = create_backup(self.data_dir, dest)
+        self.app.state.audit.record("backup_created", "console", target=Path(info["path"]).name,
+                                    details={"path": str(info["path"]), "bytes": info["bytes"], "files": info["files"]})
+        self._glog.info("Backup creato: %s (%d byte)", info["path"], info["bytes"])
+        return Path(info["path"])
 
     def connections(self) -> int:
         return self.app.state.notifier.connection_count() if self.app is not None else 0

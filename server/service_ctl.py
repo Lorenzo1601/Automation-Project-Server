@@ -32,6 +32,9 @@ class ServiceConfig:
     port: int = 8750
     name: str = ""
     discovery_port: int = DISCOVERY_PORT
+    tls_enabled: bool = False          # HTTPS/WSS: senza certfile si usa il certificato autofirmato in <data_dir>/tls
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
 
     def save(self, path: Optional[Path] = None) -> Path:
         p = path or config_path()

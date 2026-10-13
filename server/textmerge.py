@@ -9,8 +9,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from common.filekinds import KIND_LABELS, L5K, L5X, TEXT, l5k_controller_name
+from common.filekinds import KIND_LABELS, L5K, L5X, PLCOPEN, TEXT, l5k_controller_name
 from server.merger import (Change, Conflict, L5XError, MergeResult, Resolution, _cid, _fp, diff3, merge_l5x)
+from server.plcopen import merge_plcopen
 
 _PROG = re.compile(r"^\s*PROGRAM\s+(\w+)", re.I)
 _ROUT = re.compile(r"^\s*ROUTINE\s+(\w+)", re.I)
@@ -133,7 +134,10 @@ def merge_any(kind: str, base: bytes, mine: bytes, theirs: bytes,
     """Merge 3-way in base al tipo del Master del progetto."""
     if kind == L5X:
         return merge_l5x(base, mine, theirs, resolutions)
+    if kind == PLCOPEN:
+        return merge_plcopen(base, mine, theirs, resolutions)
     if kind in (L5K, TEXT):
         return merge_text(base, mine, theirs, resolutions, kind)
     raise UnsupportedMerge(f"{KIND_LABELS.get(kind, 'Questo tipo di file')} non ammette il merge automatico: "
-                           "il Master viene solo versionato, scaricato e (da un Admin) ripristinato")
+                           "il Master viene solo versionato, scaricato e (da un Admin) ripristinato; per aggiornarlo usa "
+                           "«Prendi in carico» e poi «Check-in nuova revisione» (non «Richiedi Merge»)")

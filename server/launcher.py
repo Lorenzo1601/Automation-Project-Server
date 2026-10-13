@@ -19,11 +19,12 @@ SERVICE_CMDS = {"install", "start", "stop", "restart", "status", "remove", "run"
 USAGE = """Automation Project Server
 
   AutomationProjectServer.exe                    applicazione grafica
-  AutomationProjectServer.exe install --data-dir D:\\APS [--port 8750] [--host 0.0.0.0] [--name "Linea 1"]
-                                                 installa il servizio Windows (da prompt come amministratore)
+  AutomationProjectServer.exe install --data-dir D:\\APS [--port 8750] [--host 0.0.0.0] [--name "Linea 1"] [--tls]
+                                                 installa il servizio Windows (da prompt come amministratore);
+                                                 --tls = HTTPS (certificato autofirmato, oppure --tls-cert F.pem --tls-key F.key)
   AutomationProjectServer.exe start|stop|restart|status|remove
   AutomationProjectServer.exe run --data-dir D:\\APS       esegue il server in primo piano (prova)
-  AutomationProjectServer.exe serve [--data-dir D:\\APS] [--port 8750] [--seed-project NOME --master FILE]
+  AutomationProjectServer.exe serve [--data-dir D:\\APS] [--port 8750] [--tls] [--seed-project NOME --master FILE]
                                                  server da riga di comando, senza interfaccia
 
 Da cmd: start /wait "" AutomationProjectServer.exe status

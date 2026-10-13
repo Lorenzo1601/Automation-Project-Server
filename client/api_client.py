@@ -5,6 +5,7 @@ progetto usano ``self.project_id`` (impostato dalla GUI con ``set_project``).
 """
 from __future__ import annotations
 
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -12,11 +13,15 @@ from typing import Optional
 
 import httpx
 
+from client import trust as _trust
 from common.roles import Role
+from common.schemas_branches import BranchCreate, BranchOut
+from common.schemas_revisions import CompareOut, LockIn, LockOut, RevisionPatchIn
 from common.schemas import (AuditOut, AuditVerifyOut, AuthSessionOut, DecisionIn, DeveloperOut, MasterInfo,
-                            PermissionIn, PermissionOut, ProjectCreate, ProjectOut, ProjectUpdate,
+                            PermissionIn, PermissionOut, ProjectCreate, ProjectDeleteOut, ProjectOut, ProjectUpdate,
                             ProposalDetail, ProposalSummary, ResolutionIn, ResolutionsIn, RestoreIn, RoleOut,
                             TokenPair, UserCreate, UserOut, UserUpdate)
+from common.schemas_comments import CommentEdit, CommentIn, CommentOut
 
 
 class ApiError(Exception):
@@ -25,15 +30,62 @@ class ApiError(Exception):
         self.status, self.detail = status, detail
 
 
+class TlsTrustError(ApiError):
+    """Problema di fiducia sul certificato HTTPS del server.
+
+    ``kind``: ``untrusted`` (certificato non verificabile: si puo' chiedere all'utente di considerarlo attendibile) oppure
+    ``changed`` (l'impronta non coincide con quella salvata: possibile attacco o certificato rigenerato).
+    """
+
+    def __init__(self, kind: str, host: str, port: int, detail: str, expected: str = "", actual: str = ""):
+        super().__init__(0, detail)
+        self.kind, self.host, self.port, self.expected, self.actual = kind, host, port, expected, actual
+
+
+_VERIFY_IT = {"self-signed certificate": "autofirmato", "self signed certificate": "autofirmato",
+              "certificate has expired": "scaduto", "unable to get local issuer certificate": "emittente sconosciuto",
+              "self-signed certificate in certificate chain": "emittente sconosciuto"}
+
+
+def _exc_chain(exc: BaseException):
+    seen: set[int] = set()
+    e: Optional[BaseException] = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        yield e
+        e = e.__cause__ or e.__context__
+
+
+def tls_problem(exc: BaseException, base_url: str) -> Optional[TlsTrustError]:
+    """Riconosce nella catena di un errore httpx un problema di certificato (pin cambiato / non verificabile)."""
+    host, port = _trust.host_port(base_url)
+    for e in _exc_chain(exc):
+        if isinstance(e, _trust.PinMismatch):
+            return TlsTrustError("changed", host, port, _trust.changed_message(host, port, e.expected, e.actual),
+                                 e.expected, e.actual)
+        if isinstance(e, ssl.SSLCertVerificationError):
+            msg = str(getattr(e, "verify_message", "") or "")
+            reason = _VERIFY_IT.get(msg.lower(), "hostname non corrispondente" if "hostname" in msg.lower() or "ip address" in msg.lower() else msg)
+            return TlsTrustError("untrusted", host, port, _trust.untrusted_message(host, port, reason))
+    return None
+
+
 class ApiClient:
-    def __init__(self, base_url: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, timeout: float = 60.0, trust: Optional[_trust.TrustStore] = None):
         self.base_url = base_url.rstrip("/")
+        self.trust = trust
+        self.tls_issue: Optional[TlsTrustError] = None       # ultimo problema di certificato incontrato (es. da health())
+        kw = {}
+        ctx = _trust.context_for(self.base_url, trust)       # https: fiducia di sistema oppure pin salvato; http: None
+        if ctx is not None:
+            kw["verify"] = ctx
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout,
-                                  headers={"User-Agent": "AutomationProjectClient/2.0"})
+                                  headers={"User-Agent": "AutomationProjectClient/2.0"}, **kw)
         self.tokens: Optional[TokenPair] = None
         self._expires_at = 0.0
         self._refresh_lock = threading.Lock()
         self.project_id: Optional[int] = None
+        self.branch: Optional[str] = None          # slug del branch su cui operano le chiamate di progetto (None = principale)
 
     # ------------------------------------------------------------------ stato
     @property
@@ -45,6 +97,25 @@ class ApiClient:
         return self.tokens is not None
 
     @property
+    def secure(self) -> bool:
+        """True se la connessione e' cifrata (https)."""
+        return _trust.is_secure_url(self.base_url)
+
+    def _transport_error(self, exc: httpx.HTTPError) -> ApiError:
+        """Traduce un errore di rete httpx: problemi di certificato -> ``TlsTrustError``; altrimenti ``ApiError`` status 0."""
+        if self.secure:
+            tls = tls_problem(exc, self.base_url)
+            if tls is not None:
+                self.tls_issue = tls
+                return tls
+            if any(isinstance(e, ssl.SSLError) for e in _exc_chain(exc)):
+                return ApiError(0, _trust.wrong_protocol_message(self.base_url))
+        hint = ""
+        if not self.secure and isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError)):
+            hint = " Se il server usa HTTPS, scrivi l'indirizzo con https://."
+        return ApiError(0, f"Server non raggiungibile: {exc}{hint}")
+
+    @property
     def role(self) -> Role:
         return Role.parse(self.user.role) if self.user else Role.VIEWER
 
@@ -53,13 +124,14 @@ class ApiClient:
         """Identificativo di presenza usato dal server nei partecipanti (``u<user_id>``)."""
         return f"u{self.user.id}" if self.user else ""
 
-    def set_project(self, project_id: Optional[int]) -> None:
+    def set_project(self, project_id: Optional[int], branch: Optional[str] = None) -> None:
         self.project_id = project_id
+        self.branch = branch if project_id is not None else None
 
     def ws_url(self) -> str:
         scheme = "wss" if self.base_url.startswith("https") else "ws"
         host = self.base_url.split("://", 1)[1]
-        return f"{scheme}://{host}/ws?token={self.tokens.access_token}&project={self.project_id}"
+        return f"{scheme}://{host}/ws?token={self.tokens.access_token}&project={self.project_id}" + (f"&branch={self.branch}" if self.branch else "")
 
     # ---------------------------------------------------------------- trasporto
     def _store(self, pair: TokenPair) -> TokenPair:
@@ -74,7 +146,7 @@ class ApiClient:
             try:
                 r = self._http.post("/api/auth/refresh", json={"refresh_token": self.tokens.refresh_token})
             except httpx.HTTPError as exc:
-                raise ApiError(0, f"Server non raggiungibile: {exc}") from exc
+                raise self._transport_error(exc) from exc
             if r.status_code != 200:
                 self.tokens = None
                 raise ApiError(401, "Sessione scaduta: effettua di nuovo il login")
@@ -84,10 +156,14 @@ class ApiClient:
         if auth and self.tokens and time.monotonic() >= self._expires_at - 30:
             self._refresh()
         headers = {"Authorization": f"Bearer {self.tokens.access_token}"} if (auth and self.tokens) else {}
+        branch, pid = kw.pop("branch", self.branch), self.project_id      # branch=None: sempre il principale (varianti *_for)
+        if branch and pid is not None and url.startswith(f"/api/projects/{pid}/") \
+                and not url.startswith(f"/api/projects/{pid}/branches"):
+            kw["params"] = {**(kw.get("params") or {}), "branch": branch}      # le chiamate di progetto vanno al branch corrente
         try:
             r = self._http.request(method, url, headers=headers, **kw)
         except httpx.HTTPError as exc:
-            raise ApiError(0, f"Server non raggiungibile: {exc}") from exc
+            raise self._transport_error(exc) from exc
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)
@@ -105,9 +181,12 @@ class ApiClient:
 
     # ------------------------------------------------------------------- auth
     def health(self) -> bool:
+        self.tls_issue = None
         try:
             return self._http.get("/api/health", timeout=4).status_code == 200
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            if self.secure:
+                self.tls_issue = tls_problem(exc, self.base_url)     # None se non e' un problema di certificato
             return False
 
     def login(self, username: str, password: str) -> TokenPair:
@@ -157,23 +236,36 @@ class ApiClient:
     def update_project(self, pid: int, data: ProjectUpdate) -> ProjectOut:
         return ProjectOut(**self._req("PATCH", f"/api/projects/{pid}", json=data.model_dump(exclude_none=True)).json())
 
+    def delete_project(self, pid: int, confirm_name: str) -> ProjectDeleteOut:
+        """Elimina il progetto, i suoi file e il suo audit (solo Admin). ``confirm_name`` deve essere il nome esatto."""
+        return ProjectDeleteOut(**self._req("DELETE", f"/api/projects/{pid}", params={"confirm": confirm_name}).json())
+
+    def export_project(self, pid: int, dest: Path) -> Path:
+        """Scarica un archivio .zip del progetto (revisioni conservate + storico + audit CSV). Solo Admin."""
+        r = self._req("GET", f"/api/projects/{pid}/export", branch=None)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r.content)
+        return dest
+
     def permissions(self, pid: int) -> list[PermissionOut]:
-        return [PermissionOut(**p) for p in self._req("GET", f"/api/projects/{pid}/permissions").json()]
+        return [PermissionOut(**p) for p in self._req("GET", f"/api/projects/{pid}/permissions", branch=None).json()]
 
     def set_permission(self, pid: int, user_id: int, role: Optional[str]) -> list[PermissionOut]:
-        r = self._req("PUT", f"/api/projects/{pid}/permissions", json=PermissionIn(user_id=user_id, role=role).model_dump())
+        r = self._req("PUT", f"/api/projects/{pid}/permissions", json=PermissionIn(user_id=user_id, role=role).model_dump(),
+                      branch=None)
         return [PermissionOut(**p) for p in r.json()]
 
     def init_master_for(self, pid: int, file: Path) -> MasterInfo:
         with open(file, "rb") as f:
-            r = self._req("POST", f"/api/projects/{pid}/master/init", files={"file": (file.name, f, "application/octet-stream")})
+            r = self._req("POST", f"/api/projects/{pid}/master/init", files={"file": (file.name, f, "application/octet-stream")},
+                          branch=None)
         return MasterInfo(**r.json())
 
     def reimport_master_for(self, pid: int, file: Path, reason: str) -> MasterInfo:
         """Reimporta il file base (Master) di un progetto in corso: nuova revisione (Lead/Admin)."""
         with open(file, "rb") as f:
             r = self._req("POST", f"/api/projects/{pid}/master/reimport", data={"reason": reason},
-                          files={"file": (file.name, f, "application/octet-stream")})
+                          files={"file": (file.name, f, "application/octet-stream")}, branch=None)
         return MasterInfo(**r.json())
 
     # -------------------------------------------------------------------- audit
@@ -201,6 +293,22 @@ class ApiClient:
     def restore(self, revision: int, reason: str) -> MasterInfo:
         return MasterInfo(**self._req("POST", self._p("/master/restore"),
                                       json=RestoreIn(revision=revision, reason=reason).model_dump()).json())
+
+    # varianti con progetto esplicito: non toccano ``project_id`` (le usa la vista Admin, che lavora su un progetto
+    # diverso da quello aperto in dashboard mentre altri thread usano lo stato condiviso)
+    def history_for(self, pid: int) -> list[MasterInfo]:
+        return [MasterInfo(**m) for m in self._req("GET", f"/api/projects/{pid}/master/history", branch=None).json()]
+
+    def download_master_for(self, pid: int, dest: Path, revision: Optional[int] = None) -> int:
+        r = self._req("GET", f"/api/projects/{pid}/master/download", params={"revision": revision} if revision else None,
+                      branch=None)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r.content)
+        return int(r.headers["X-Revision"])
+
+    def restore_for(self, pid: int, revision: int, reason: str) -> MasterInfo:
+        return MasterInfo(**self._req("POST", f"/api/projects/{pid}/master/restore",
+                                      json=RestoreIn(revision=revision, reason=reason).model_dump(), branch=None).json())
 
     def report_revision(self, revision: Optional[int] = None) -> None:
         """Heartbeat di presenza (+ revisione scaricata): rende l'utente 'attivo' per il quorum."""
@@ -244,3 +352,98 @@ class ApiClient:
     def force_merge(self, pid: str, comment: str) -> ProposalDetail:
         return ProposalDetail(**self._req("POST", self._p(f"/proposals/{pid}/force-merge"),
                                           json=DecisionIn(comment=comment).model_dump()).json())
+
+    # ------------------------------------------------------------------ discussione sulle richieste
+    def comments(self, prop_id: str) -> list[CommentOut]:
+        return [CommentOut(**c) for c in self._req("GET", self._p(f"/proposals/{prop_id}/comments")).json()]
+
+    def add_comment(self, prop_id: str, text: str, reply_to: Optional[int] = None,
+                    anchor: Optional[str] = None) -> CommentOut:
+        body = CommentIn(text=text, reply_to=reply_to, anchor=anchor or None)
+        return CommentOut(**self._req("POST", self._p(f"/proposals/{prop_id}/comments"), json=body.model_dump()).json())
+
+    def edit_comment(self, comment_id: int, text: str) -> CommentOut:
+        return CommentOut(**self._req("PATCH", self._p(f"/comments/{comment_id}"),
+                                      json=CommentEdit(text=text).model_dump()).json())
+
+    def delete_comment(self, comment_id: int) -> CommentOut:
+        return CommentOut(**self._req("DELETE", self._p(f"/comments/{comment_id}")).json())
+
+    # ------------------------------------------- confronto / etichette / blocco delle revisioni, lock, check-in
+    def compare_revisions(self, a: int, b: int) -> CompareOut:
+        """Differenze dalla rev ``a`` alla rev ``b`` (entrambe conservate; non per i file binari)."""
+        return CompareOut(**self._req("GET", self._p("/master/compare"), params={"from": a, "to": b}).json())
+
+    def compare_revisions_for(self, pid: int, a: int, b: int) -> CompareOut:
+        return CompareOut(**self._req("GET", f"/api/projects/{pid}/master/compare", params={"from": a, "to": b},
+                                      branch=None).json())
+
+    def patch_revision(self, revision: int, label: Optional[str] = None, locked: Optional[bool] = None) -> MasterInfo:
+        """Etichetta e/o blocca una revisione (Lead/Admin; sbloccare: solo Admin)."""
+        body = RevisionPatchIn(label=label, locked=locked).model_dump(exclude_none=True)
+        return MasterInfo(**self._req("PATCH", self._p(f"/master/revisions/{revision}"), json=body).json())
+
+    def patch_revision_for(self, pid: int, revision: int, label: Optional[str] = None,
+                           locked: Optional[bool] = None) -> MasterInfo:
+        body = RevisionPatchIn(label=label, locked=locked).model_dump(exclude_none=True)
+        return MasterInfo(**self._req("PATCH", f"/api/projects/{pid}/master/revisions/{revision}", json=body,
+                                      branch=None).json())
+
+    def lock_state(self) -> LockOut:
+        return LockOut(**self._req("GET", self._p("/lock")).json())
+
+    def lock_acquire(self, note: str = "") -> LockOut:
+        """«Prendi in carico» il Master (409 se e' gia' di un altro)."""
+        return LockOut(**self._req("POST", self._p("/lock"), json=LockIn(note=note).model_dump()).json())
+
+    def lock_renew(self) -> LockOut:
+        return LockOut(**self._req("POST", self._p("/lock/renew")).json())
+
+    def lock_release(self, reason: str = "") -> LockOut:
+        """«Rilascia» (holder) o «Forza rilascio» (Admin, ``reason`` obbligatorio)."""
+        return LockOut(**self._req("DELETE", self._p("/lock"), params={"reason": reason} if reason else None).json())
+
+    def checkin_master(self, file: Path, message: str) -> MasterInfo:
+        """Check-in diretto di una nuova revisione di un Master binario (serve la presa in carico attiva)."""
+        with open(file, "rb") as f:
+            r = self._req("POST", self._p("/master/checkin"), data={"message": message},
+                          files={"file": (file.name, f, "application/octet-stream")})
+        return MasterInfo(**r.json())
+
+    # ------------------------------------------------------------------ branch
+    def _bp(self, pid: Optional[int]) -> int:
+        """Progetto delle chiamate sui branch: ``pid`` esplicito (console Admin) oppure quello aperto."""
+        pid = self.project_id if pid is None else pid
+        if pid is None:
+            raise ApiError(0, "Nessun progetto selezionato")
+        return pid
+
+    def branches(self, pid: Optional[int] = None) -> list[BranchOut]:
+        return [BranchOut(**b) for b in self._req("GET", f"/api/projects/{self._bp(pid)}/branches").json()]
+
+    def create_branch(self, name: str, kind: str = "personal", from_revision: Optional[int] = None,
+                      pid: Optional[int] = None) -> BranchOut:
+        body = BranchCreate(name=name, kind=kind, from_revision=from_revision).model_dump(exclude_none=True)
+        return BranchOut(**self._req("POST", f"/api/projects/{self._bp(pid)}/branches", json=body).json())
+
+    def branch_commit(self, slug: str, file: Path, message: str) -> MasterInfo:
+        """Salvataggio diretto di una nuova revisione su un branch personale (proprietario o Admin)."""
+        with open(file, "rb") as f:
+            r = self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/commit", data={"message": message},
+                          files={"file": (file.name, f, "application/octet-stream")})
+        return MasterInfo(**r.json())
+
+    def branch_sync(self, slug: str) -> ProposalDetail:
+        """«Aggiorna dal principale»: porta nel branch le novita' del principale (richiesta di merge NEL branch)."""
+        return ProposalDetail(**self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/sync").json())
+
+    def branch_merge(self, slug: str, message: str = "") -> ProposalDetail:
+        """«Unisci nel principale»: richiesta di merge del branch NEL principale (consenso normale)."""
+        return ProposalDetail(**self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/merge",
+                                          data={"message": message}).json())
+
+    def close_branch(self, slug: str, pid: Optional[int] = None) -> BranchOut:
+        return BranchOut(**self._req("POST", f"/api/projects/{self._bp(pid)}/branches/{slug}/close").json())
+
+    def delete_branch(self, slug: str, pid: Optional[int] = None) -> None:
+        self._req("DELETE", f"/api/projects/{self._bp(pid)}/branches/{slug}")

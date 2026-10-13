@@ -12,10 +12,10 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from server.db.base import Database
-from server.db.models import AuditLog
+from server.db.models import AUDIT_TRIGGERS, AuditLog
 
 GENESIS = "0" * 64
 
@@ -46,6 +46,45 @@ class AuditService:
             s.expunge(row)
             return row
 
+    def purge_project(self, project_id: int) -> int:
+        """MANUTENZIONE ESPLICITA: cancella tutto l'audit di un progetto e ricalcola la catena di hash. Ritorna le righe rimosse.
+
+        E' l'unica eccezione all'immutabilita' dell'audit ed e' usata solo dall'eliminazione di un progetto (Admin).
+        In una sola transazione e con il lock dell'audit: rimuove i trigger (SQLite), cancella con SQL grezzo le righe del
+        progetto, ricalcola ``prev_hash``/``hash`` delle righe rimaste (in ordine di id, cosi' ``verify()`` resta ok) e
+        ricrea i trigger identici. Se qualcosa fallisce la transazione torna indietro e l'audit resta com'era.
+        Su PostgreSQL non ci sono trigger e si salta quel passaggio.
+
+        Per scelta dell'amministratore l'eliminazione di un progetto non lascia nessuna riga di audit: la catena
+        resta valida e di quel progetto non rimane traccia nel registro.
+        """
+        sqlite = self.db.engine.dialect.name == "sqlite"
+        with self._lock, self.db.engine.connect() as cx:
+            if sqlite:
+                cx.exec_driver_sql("BEGIN IMMEDIATE")        # pysqlite non apre transazioni per il DDL: lo facciamo noi
+            try:
+                if sqlite:
+                    for name in AUDIT_TRIGGERS:
+                        cx.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+                removed = cx.execute(text("DELETE FROM audit_log WHERE project_id = :p"), {"p": project_id}).rowcount
+                prev = GENESIS
+                rows = cx.execute(text("SELECT id, ts, actor, action, project_id, target, details, ip, prev_hash, hash "
+                                       "FROM audit_log ORDER BY id")).all()
+                for r in rows:
+                    h = _digest(prev, r.ts, r.actor, r.action, r.project_id, r.target, r.details, r.ip)
+                    if r.prev_hash != prev or r.hash != h:
+                        cx.execute(text("UPDATE audit_log SET prev_hash = :ph, hash = :h WHERE id = :i"),
+                                   {"ph": prev, "h": h, "i": r.id})
+                    prev = h
+                if sqlite:
+                    for ddl in AUDIT_TRIGGERS.values():
+                        cx.exec_driver_sql(ddl)
+                cx.commit()
+            except BaseException:
+                cx.rollback()
+                raise
+        return max(int(removed or 0), 0)
+
     def verify(self) -> tuple[bool, Optional[int], int]:
         """-> (integra, id della prima riga incoerente, righe controllate)."""
         prev, n = GENESIS, 0
@@ -57,6 +96,15 @@ class AuditService:
                     return False, r.id, n
                 prev = r.hash
         return True, None, n
+
+    def for_project(self, project_id: int) -> list[AuditLog]:
+        """Tutte le righe di un progetto, dalla piu' vecchia (per l'esportazione)."""
+        with self.db.scope() as s:
+            rows = list(s.execute(select(AuditLog).where(AuditLog.project_id == project_id)
+                                  .order_by(AuditLog.id)).scalars())
+            for r in rows:
+                s.expunge(r)
+            return rows
 
     def query(self, *, project_ids: Optional[set[int]] = None, include_global: bool = True,
               action: Optional[str] = None, actor: Optional[str] = None, limit: int = 200,

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QTableWidget,
                                QTableWidgetItem, QWidget)
 
@@ -48,20 +49,29 @@ def role_label(key: str) -> str:
         return key
 
 
+def tint(color: str, alpha: int) -> str:
+    """'#RRGGBB' -> 'rgba(r, g, b, alpha)' (alpha 0-255) per fondi e bordi trasparenti nei QSS inline."""
+    c = QColor(color)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
+
+
 def chip(text: str, color: Optional[str] = None, mono: bool = False, max_chars: int = 0) -> QFrame:
+    """Pillola informativa. Con ``color`` il fondo e il bordo prendono una tinta trasparente dello stesso colore."""
     f = QFrame()
     f.setObjectName("Chip")
     l = QHBoxLayout(f)
-    l.setContentsMargins(8, 2, 8, 2)
+    l.setContentsMargins(9, 2, 9, 2)
     shown = text if not max_chars or len(text) <= max_chars else text[:max_chars - 1] + "…"
     lab = QLabel(shown)
     if shown != text:
         f.setToolTip(text)
     fam = FONT_MONO if mono else FONT_UI
     if color:
+        f.setStyleSheet(f"QFrame#Chip {{ background-color: {tint(color, 26)}; border: 1px solid {tint(color, 78)}; "
+                        f"border-radius: 10px; }}")
         lab.setStyleSheet(f"color:{color}; font-size:11px; font-weight:600; font-family:{fam}; background:transparent;")
     else:
-        lab.setStyleSheet(f"font-family:{fam}; font-size:11px; background:transparent;")
+        lab.setStyleSheet(f"font-family:{fam}; font-size:11px; color:{T['TEXT_DIM']}; background:transparent;")
     l.addWidget(lab)
     return f
 
@@ -101,8 +111,10 @@ def make_table(headers: list[str], stretch_col: Optional[int] = None) -> QTableW
     t.setAlternatingRowColors(True)
     t.verticalHeader().setVisible(False)
     t.setShowGrid(False)
-    t.verticalHeader().setDefaultSectionSize(38)
+    t.verticalHeader().setDefaultSectionSize(40)
     t.horizontalHeader().setHighlightSections(False)
+    t.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    t.horizontalHeader().setMinimumSectionSize(60)
     t.horizontalHeader().setStretchLastSection(stretch_col is None)
     if stretch_col is not None:
         t.horizontalHeader().setSectionResizeMode(stretch_col, QHeaderView.Stretch)
@@ -133,6 +145,25 @@ def muted(text: str) -> QLabel:
     l = QLabel(text)
     l.setProperty("muted", True)
     l.setWordWrap(True)
+    return l
+
+
+def subtitle(text: str) -> QLabel:
+    """Sottotitolo di pagina (grigio, a capo automatico)."""
+    l = QLabel(text)
+    l.setProperty("subtitle", True)
+    l.setWordWrap(True)
+    return l
+
+
+def eyebrow(text: str) -> QLabel:
+    """Etichetta maiuscola piccola con spaziatura tra le lettere (titoletti di sezione, etichette dei campi)."""
+    l = QLabel(text.upper())
+    l.setProperty("eyebrow", True)
+    f = QFont(l.font())
+    f.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+    f.setBold(True)
+    l.setFont(f)
     return l
 
 

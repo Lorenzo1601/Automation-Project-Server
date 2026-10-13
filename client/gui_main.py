@@ -5,25 +5,32 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QHBoxLayout, QInputDialog, QMainWindow,
                                QMessageBox, QStackedWidget, QSystemTrayIcon, QWidget)
 
-from client.api_client import ApiClient, ApiError
+from client import trust as _trust
+from client.api_client import ApiClient, ApiError, TlsTrustError
 from client.discovery import discover as discover_servers
 from client.gui_approval import ApprovalDialog
 import shutil
 import threading
 
 from client.auto_reimport import foreign_changes, manual_checkout_notice, merge_notice
-from client.localfiles import default_workdir, hide_ref_dir, norm_ext, ref_path
+from client.branch_info import abilities, display_name as branch_display_name
+from client.localfiles import branch_folder, default_workdir, hide_ref_dir, norm_ext, prune_local, ref_path
 from common.filekinds import DEFAULT_NAME, import_filters, rev_filename
 from client.theme import apply_dark_theme
 from client.theme.tokens import T
 from client.theme.widgets import app_icon, icon
 from client.views.audit_view import AuditView
-from client.views.dashboard_view import DashboardView, HistoryDialog
+from client.views.branches_dialog import BranchesDialog
+from client.views.dashboard_view import DashboardView
+from client.views.help_view import HelpView
+from client.views.history_actions import HistoryActions
+from client.views.history_dialog import MIN_REASON, HistoryDialog, revision_save_filter, revision_save_name
 from client.views.merge_dialog import MergeRequestDialog
-from client.views.login_view import LoginView, PasswordChangeDialog
+from client.views.login_view import LoginView, PasswordChangeDialog, ask_forget_pin, ask_trust
 from client.views.project_dialogs import NewProjectDialog
 from client.views.sidebar import Sidebar
 from client.views.user_mgmt_view import UserMgmtView
@@ -31,9 +38,11 @@ from client.workers import run_async
 from client.ws_listener import WsListener
 from common.roles import Role
 from common.schemas import ProjectOut
+from common.schemas_branches import BranchOut
 
 HEARTBEAT_MS = 30_000
-NAV_INDEX = {"dashboard": 0, "audit": 1, "users": 2}
+BRANCH_UNSUPPORTED = (404, 405, 501)          # server senza i branch: il selettore resta sul solo principale
+NAV_INDEX = {"dashboard": 0, "audit": 1, "users": 2, "help": 3}
 
 
 def _pick_folder_dialog(parent: QWidget, title: str, start: str) -> str:
@@ -54,6 +63,11 @@ class MainWindow(QMainWindow):
         self._run = run
         self.pick_folder: Callable[[QWidget, str, str], str] = _pick_folder_dialog     # sostituibile nei test
         self.pick_file: Callable[[QWidget, str, str, str], str] = _pick_file_dialog    # (parent, titolo, cartella, filtri)
+        # fiducia nei certificati HTTPS (pinning alla prima connessione): archivio e dialoghi sostituibili nei test
+        self.trust = _trust.default_store()
+        self.confirm_trust: Callable = ask_trust                    # (parent, host, port, CertSummary, motivo) -> bool
+        self.confirm_forget_pin: Callable = ask_forget_pin          # (parent, host, port, messaggio) -> bool (True = rimuovi il pin)
+        self.fetch_cert: Callable[[str, int], bytes] = _trust.fetch_server_cert
         self.settings = settings or QSettings("AutomationProjectServer", "Client2")
         self.setWindowTitle("Automation Project Client")
         self.setWindowIcon(app_icon())
@@ -61,8 +75,11 @@ class MainWindow(QMainWindow):
         self.api: Optional[ApiClient] = None
         self.project: Optional[ProjectOut] = None
         self.projects: list[ProjectOut] = []
+        self.branches: list[BranchOut] = []                  # branch del progetto aperto (aperti e non)
+        self.branches_dialog: Optional[BranchesDialog] = None
         self.dialogs: dict[str, ApprovalDialog] = {}
         self.ws = WsListener(self)
+        self.ws.trust = self.trust
         self.ws.event_received.connect(self.on_event)
         self.ws.state_changed.connect(self._ws_state)
         self._hb = QTimer(self, interval=heartbeat_ms)
@@ -70,6 +87,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.login = LoginView(servers=[self.settings.value("server_url", "http://localhost:8750")], run=run, discover=discover)
+        self.login.trust = self.trust
         self.login.login_requested.connect(self._do_login)
         self.stack.addWidget(self.login)
         self.workspace_widget: Optional[QWidget] = None
@@ -86,9 +104,9 @@ class MainWindow(QMainWindow):
                            self.settings.value("username", ""))
         self.login.search_servers(auto=True)             # trova da solo i server in rete (o riusa l'ultimo usato)
 
-    def _do_login(self, url: str, user: str, pw: str) -> None:
+    def _do_login(self, url: str, user: str, pw: str, _retried: bool = False) -> None:
         self.login.set_busy(True)
-        api = ApiClient(url)
+        api = ApiClient(url, trust=self.trust)
 
         def ok(_pair) -> None:
             self.login.set_busy(False)
@@ -103,9 +121,38 @@ class MainWindow(QMainWindow):
                 self._enter_workspace()
 
         def fail(exc: Exception) -> None:
+            if isinstance(exc, TlsTrustError) and self._tls_failed(exc, lambda: self._do_login(url, user, pw, True), _retried):
+                return
             self.login.set_busy(False)
             self.login.set_error(exc.detail if isinstance(exc, ApiError) else str(exc))
         self._run(lambda: api.login(user, pw), ok, fail)
+
+    def _tls_failed(self, exc: TlsTrustError, retry: Callable[[], None], retried: bool) -> bool:
+        """Certificato non verificabile (prima connessione: chiede se fidarsi e salva l'impronta) o cambiato (rifiuta)."""
+        host, port = exc.host, exc.port
+        if exc.kind == "untrusted" and not retried:
+            def got(der: bytes) -> None:
+                summary = _trust.describe_cert(der)
+                if self.confirm_trust(self, host, port, summary, exc.detail):
+                    self.trust.pin(host, port, summary.sha256, summary, der)
+                    retry()
+                else:
+                    self.login.set_busy(False)
+                    self.login.set_error("Connessione annullata: certificato non considerato attendibile.")
+
+            def unreadable(e: Exception) -> None:
+                self.login.set_busy(False)
+                self.login.set_error(f"Impossibile leggere il certificato del server: {e}")
+            self._run(lambda: self.fetch_cert(host, port), got, unreadable)
+            return True
+        if exc.kind == "changed":
+            self.login.set_busy(False)
+            self.login.set_error("Il certificato del server e' cambiato: accesso bloccato per sicurezza.")
+            if self.confirm_forget_pin(self, host, port, exc.detail):
+                self.trust.remove(host, port)
+                self.login.set_error("Fiducia rimossa: premi Accedi per vedere e verificare il nuovo certificato.")
+            return True
+        return False
 
     def _force_password_change(self, error: str = "") -> None:
         dlg = PasswordChangeDialog(forced=True, parent=self)
@@ -134,6 +181,7 @@ class MainWindow(QMainWindow):
     def _enter_workspace(self) -> None:
         api = self.api
         assert api is not None and api.user is not None
+        self.branches = []
         if self.workspace_widget is not None:
             self.stack.removeWidget(self.workspace_widget)
             self.workspace_widget.deleteLater()
@@ -142,9 +190,13 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardView()
         self.audit = AuditView()
         self.users = UserMgmtView(api, run=self._run)
+        self.help = HelpView()
         self.pages = QStackedWidget()
-        for w in (self.dashboard, self.audit, self.users):
+        for w in (self.dashboard, self.audit, self.users, self.help):
             self.pages.addWidget(w)
+        if not hasattr(self, "_f1"):                                # F1: apre la Guida (una sola volta)
+            self._f1 = QShortcut(QKeySequence(Qt.Key_F1), self)
+            self._f1.activated.connect(self.show_help)
         root = QWidget()
         lay = QHBoxLayout(root)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -172,6 +224,16 @@ class MainWindow(QMainWindow):
         self.dashboard.refresh_requested.connect(self.refresh_all)
         self.dashboard.folder_change_requested.connect(self.choose_folder)
         self.dashboard.folder_open_requested.connect(self.open_folder)
+        self.dashboard.lock_take_requested.connect(self.take_lock)
+        self.dashboard.lock_release_requested.connect(self.release_lock)
+        self.dashboard.lock_force_requested.connect(self.force_release_lock)
+        self.dashboard.checkin_requested.connect(self.checkin_master)
+        self.sidebar.branch_changed.connect(self.select_branch)
+        self.dashboard.branches_requested.connect(self.show_branches)
+        self.dashboard.commit_requested.connect(lambda: self.commit_to_branch())
+        self.dashboard.branch_sync_requested.connect(lambda: self.sync_branch())
+        self.dashboard.branch_merge_requested.connect(lambda: self.merge_branch())
+        self.dashboard.branch_leave_requested.connect(lambda: self.select_branch(None))
         self.audit.query_requested.connect(self._audit_query)
         self.audit.verify_requested.connect(self._audit_verify)
         self.users.projects_changed.connect(self.load_projects)
@@ -182,6 +244,15 @@ class MainWindow(QMainWindow):
         self.dashboard.set_enabled_project(False)
         self.load_projects()
         self._hb.start()
+
+    def show_help(self, topic: str = "") -> None:
+        """Apre la Guida (scorciatoia F1), opzionalmente su un argomento."""
+        if self.workspace_widget is None or not hasattr(self, "help"):
+            return
+        self.sidebar.select("help")
+        self._nav("help")
+        if isinstance(topic, str) and topic:
+            self.help.show_topic(topic)
 
     def _nav(self, key: str) -> None:
         self.pages.setCurrentIndex(NAV_INDEX[key])
@@ -214,6 +285,7 @@ class MainWindow(QMainWindow):
         if cur is None:
             self.project = None
             self.api.set_project(None)
+            self._reset_branches()
             self.dashboard.set_master("Nessun progetto", None)
             self.dashboard.set_enabled_project(False)
             self.dashboard.set_proposals([])
@@ -234,9 +306,13 @@ class MainWindow(QMainWindow):
         if self.project is None or self.project.id != pid:
             for d in list(self.dialogs.values()):
                 d.close()
+        keep_branch = self.api.branch if self.api.project_id == pid else None       # stesso progetto: resta nel suo branch
         self.project = p
         self.settings.setValue("project_id", pid)
-        self.api.set_project(pid)
+        self.api.set_project(pid, keep_branch)
+        if not keep_branch:
+            self._reset_branches()
+        self.dashboard.set_lock(None)
         self.dashboard.set_proposals([])
         self.dashboard.set_developers([])
         self._apply_project()
@@ -249,8 +325,10 @@ class MainWindow(QMainWindow):
             return
         self.dashboard.set_identity(self.api.session_key, self.project_role)
         self.dashboard.set_master_state(p.head_revision is not None)
+        self.dashboard.set_master_kind(p.master_kind if p.head_revision is not None else None)
         self.dashboard.set_enabled_project(True)
-        self.dashboard.btn_merge.setEnabled(p.head_revision is not None and not p.archived)
+        self.dashboard.set_branch(self.api.branch, self.branch)
+        self.dashboard.set_merge_allowed(p.head_revision is not None and not p.archived)
         self.dashboard.btn_checkout.setEnabled(p.head_revision is not None)
         self._update_local_label()
 
@@ -263,14 +341,20 @@ class MainWindow(QMainWindow):
         return bool(self.settings.value(self._folder_key(), ""))
 
     @property
-    def local_folder(self) -> Path:
-        """Cartella locale del progetto: scelta dall'utente, altrimenti ``<workspace>/<utente>/<progetto>``."""
+    def project_folder(self) -> Path:
+        """Cartella locale del progetto (principale): scelta dall'utente, altrimenti ``<workspace>/<utente>/<progetto>``."""
         chosen = self.settings.value(self._folder_key(), "")
         if chosen:
             return Path(str(chosen))
         root = self.settings.value("workspace", str(Path.home() / "AutomationProjectClient"))
         return default_workdir(root, self.api.user.username if self.api and self.api.user else "dev",
                                self.project.slug if self.project else "progetto")
+
+    @property
+    def local_folder(self) -> Path:
+        """Cartella locale del contesto corrente: quella del progetto sul principale, ``<progetto>/branches/<slug>``
+        su un branch (ognuna con il proprio ``.aps``)."""
+        return branch_folder(self.project_folder, self.api.branch if self.api else None)
 
     workdir = local_folder                                       # nome storico
 
@@ -292,7 +376,7 @@ class MainWindow(QMainWindow):
         """Chiede all'utente la cartella locale del progetto (dove salva il checkout e dove cerca i file da unire)."""
         if self.project is None or self.api is None:
             return False
-        cur = self.local_folder
+        cur = self.project_folder                                   # i branch stanno in <cartella>/branches/<slug>
         start = str(cur if cur.is_dir() else (cur.parent if cur.parent.is_dir() else Path.home()))
         d = self.pick_folder(self, f"Cartella locale del progetto «{self.project.name}»", start)
         if not d:
@@ -310,7 +394,16 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(f)))
 
     def _base_key(self) -> str:
-        return f"base/{self.api.base_url}/{self.project.id if self.project else 0}/{self.api.user.id}"
+        """Chiave delle impostazioni della copia di lavoro (revisione base, file): una per progetto e una per ogni branch."""
+        key = f"base/{self.api.base_url}/{self.project.id if self.project else 0}/{self.api.user.id}"
+        return f"{key}/b/{self.api.branch}" if self.api.branch else key
+
+    # ----------------------------------------------------------------- branch (contesto)
+    @property
+    def branch(self) -> Optional[BranchOut]:
+        """Descrizione del branch corrente (None sul principale o se l'elenco non e' ancora arrivato)."""
+        slug = self.api.branch if self.api else None
+        return next((b for b in self.branches if b.slug == slug), None) if slug else None
 
     @property
     def base_revision(self) -> int:
@@ -324,11 +417,13 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return
         self.dashboard.set_folder(str(self.local_folder), self.folder_chosen)
+        on_branch = bool(self.api and self.api.branch)
         if self.project_role < Role.DEVELOPER:
-            self.dashboard.set_local("Accesso in sola lettura: puoi scaricare il Master e consultare cronologia e storico.")
+            self.dashboard.set_local("Accesso in sola lettura: puoi scaricare " + ("la testa del branch" if on_branch else "il Master")
+                                     + " e consultare cronologia e storico.")
             return
         wf = self.working_file
-        self.dashboard.set_local(f"Copia di lavoro: rev base <b>{self.base_revision or '-'}</b>"
+        self.dashboard.set_local(f"Copia di lavoro{' (branch)' if on_branch else ''}: rev base <b>{self.base_revision or '-'}</b>"
                                  + (f" &nbsp;|&nbsp; {wf}" if wf else ""))
 
     # ----------------------------------------------------------------- messaggi
@@ -368,21 +463,41 @@ class MainWindow(QMainWindow):
             self._run(lambda: api.report_revision(rev), None, self._quiet_err)
         else:
             self._run(api.me, None, self._quiet_err)
+        if self.project is not None and self.project.head_revision is not None:          # presa in carico (lock)
+            if self.dashboard.lock_is_mine():
+                self._run(api.lock_renew, self._lock_loaded, self._lock_failed)         # rinnovo automatico dell'holder
+            else:
+                self.refresh_lock()
 
     def refresh_all(self) -> None:
         api, proj = self.api, self.project
         if api is None or proj is None:
             return
         name = proj.name
+        live = self._same_context()                      # scarta le risposte arrivate dopo un cambio di progetto/branch
 
         def master_err(exc: Exception) -> None:
+            if not live():
+                return
             self.dashboard.set_master(name, None)
             if not (isinstance(exc, ApiError) and exc.status in (404, 409)):
                 self._quiet_err(exc)
-        self._run(api.master_info, lambda m: self.dashboard.set_master(name, m), master_err)
-        self._run(lambda: api.proposals(), self.dashboard.set_proposals, self._quiet_err)
-        self._run(api.developers, self.dashboard.set_developers, self._quiet_err)
+
+        def guarded(cb: Callable) -> Callable:
+            return lambda res: cb(res) if live() else None
+        self._run(api.master_info, guarded(lambda m: self.dashboard.set_master(name, m)), master_err)
+        self._run(lambda: api.proposals(), guarded(self.dashboard.set_proposals), self._quiet_err)
+        self._run(api.developers, guarded(self.dashboard.set_developers), self._quiet_err)
         self._run(api.projects, self._refresh_projects_meta, self._quiet_err)
+        self.refresh_lock()
+        self.load_branches()
+
+    def _same_context(self) -> Callable[[], bool]:
+        """Funzione che dice se progetto e branch sono ancora quelli di adesso (per le risposte asincrone)."""
+        api = self.api
+        pid, slug = (self.project.id if self.project else None), (api.branch if api else None)
+        return lambda: (self.api is api and api is not None and self.project is not None and self.project.id == pid
+                        and api.branch == slug)
 
     def _refresh_projects_meta(self, projects: list[ProjectOut]) -> None:
         """Aggiorna head_revision / policy senza ricostruire la selezione."""
@@ -442,7 +557,35 @@ class MainWindow(QMainWindow):
                           + (" (il file esisteva gia' con tue modifiche: non e' stato sovrascritto)" if kept else ""))
         elif announce:
             self._log(f"Master rev {rev} scaricato in {dest}")
+        self._prune_local((dest,))
         self.refresh_all()
+
+    def _prune_local(self, protect=()) -> None:
+        """Pulizia locale: tiene sul PC al massimo ``project.max_revisions`` revisioni del Master (file
+        ``<nome>_revN<ext>`` + copie in ``.aps``). Mai il file di lavoro, la sua base, file modificati o non
+        riconosciuti: vedi ``localfiles.prune_local``. Gira dopo ogni download del Master."""
+        api, proj = self.api, self.project
+        if api is None or proj is None:
+            return
+        keep = int(getattr(proj, "max_revisions", 0) or 0)
+        if keep < 1:
+            return
+        ws, name, ext, base = self.local_folder, self.master_name, self.master_ext, self.base_revision
+        keep_paths = [str(p) for p in protect if p]
+        if self.working_file:
+            keep_paths.append(self.working_file)
+        if base:
+            keep_paths.append(str(ws / rev_filename(name, base, ext)))
+
+        def work() -> list:
+            with _FILES_LOCK:
+                return prune_local(ws, name, ext, keep, keep_paths)
+
+        def done(removed: list) -> None:
+            n = len({p.name for p in removed})
+            if n and self.api is api:
+                self._log(f"Pulizia locale: rimosse {n} copie di vecchie revisioni")
+        self._run(work, done, self._quiet_err)
 
     # ------------------------------------------------- nuovo progetto / file base (Master)
     def new_project(self) -> None:
@@ -527,7 +670,117 @@ class MainWindow(QMainWindow):
             self.refresh_all()
         self._run(lambda: api.reimport_master_for(proj.id, Path(path), reason), done, self._err)
 
+    # ================================================================ presa in carico (lock) e check-in
+    def refresh_lock(self) -> None:
+        api = self.api
+        if api is None or self.project is None or self.project.head_revision is None:
+            return
+        live = self._same_context()
+        self._run(api.lock_state, lambda st: self._lock_loaded(st) if live() else None, self._quiet_err)
+
+    def _lock_loaded(self, state) -> None:
+        if self.workspace_widget is not None:
+            self.dashboard.set_lock(state)
+
+    def _lock_failed(self, exc: Exception) -> None:
+        self._quiet_err(exc)
+        self.refresh_lock()
+
+    def take_lock(self, note: str = "") -> None:
+        """«Prendi in carico»: segnala al team che stai lavorando sul Master (obbligatorio per il check-in dei binari)."""
+        api = self.api
+        if api is None or self.project is None or self.project_role < Role.DEVELOPER:
+            return
+
+        def done(st) -> None:
+            self._lock_loaded(st)
+            self._log("Hai preso in carico il Master")
+
+        def fail(exc: Exception) -> None:
+            self._err(exc)
+            self.refresh_lock()
+        self._run(lambda: api.lock_acquire(note), done, fail)
+
+    def release_lock(self) -> None:
+        api = self.api
+        if api is None or self.project is None:
+            return
+
+        def done(st) -> None:
+            self._lock_loaded(st)
+            self._log("Hai rilasciato il Master")
+        self._run(api.lock_release, done, self._lock_failed_err)
+
+    def force_release_lock(self, reason: Optional[str] = None) -> None:
+        """«Forza rilascio» (solo Admin): libera il Master preso in carico da un altro, con motivo (tracciato nell'audit)."""
+        api = self.api
+        if api is None or self.project is None or self.project_role < Role.ADMIN:
+            return
+        if not isinstance(reason, str):
+            who = self.dashboard.lock_holder()
+            reason, ok = QInputDialog.getMultiLineText(
+                self, "Forza rilascio", f"Il Master è in carico a {who or 'un altro utente'}: verrà liberato subito.\n"
+                                        "Motivo (minimo 5 caratteri, registrato nell'audit):")
+            if not ok:
+                return
+        reason = reason.strip()
+        if len(reason) < MIN_REASON:
+            QMessageBox.warning(self, "Motivo troppo breve", f"Indica un motivo di almeno {MIN_REASON} caratteri.")
+            return
+
+        def done(st) -> None:
+            self._lock_loaded(st)
+            self._log("Presa in carico forzata: il Master è libero")
+        self._run(lambda: api.lock_release(reason), done, self._lock_failed_err)
+
+    def checkin_master(self, path: Optional[str] = None, message: Optional[str] = None) -> None:
+        """Check-in diretto di una nuova revisione di un Master BINARIO (serve la presa in carico). ``path``/``message``
+        saltano i dialoghi (test)."""
+        api, proj = self.api, self.project
+        if api is None or proj is None or proj.head_revision is None or self.project_role < Role.DEVELOPER:
+            return
+        if self.master_kind != "binary":
+            QMessageBox.information(self, "Check-in", "Il check-in diretto è riservato ai file binari: per questo "
+                                                      "progetto usa «Richiedi Merge».")
+            return
+        if not self.dashboard.lock_is_mine():
+            QMessageBox.information(self, "Check-in", "Prima prendi in carico il Master («Prendi in carico»).")
+            return
+        if not isinstance(path, str):
+            path = self._pick_master_file(f"Nuova versione del file di «{proj.name}»")
+        if not path:
+            return
+        if not isinstance(message, str):
+            message, ok_ = QInputDialog.getMultiLineText(
+                self, "Check-in nuova revisione", f"Messaggio della revisione (minimo {MIN_REASON} caratteri):")
+            if not ok_:
+                return
+        message = message.strip()
+        if len(message) < MIN_REASON:
+            QMessageBox.warning(self, "Messaggio troppo breve", f"Indica un messaggio di almeno {MIN_REASON} caratteri.")
+            return
+
+        def done(m) -> None:
+            self._log(f"Check-in eseguito in «{proj.name}»: nuova rev {m.revision}")
+            self.load_projects()
+            self.refresh_all()
+        self._run(lambda: api.checkin_master(Path(path), message), done, self._lock_failed_err)
+
+    def _lock_failed_err(self, exc: Exception) -> None:
+        self._err(exc)
+        self.refresh_lock()
+
+    def _on_lock_changed(self, ev: dict) -> None:
+        """Evento ``lock_changed``: aggiorna la barra e, se e' stato un altro, avvisa senza bloccare."""
+        self.refresh_lock()
+        who = ev.get("developer")
+        if who and self.api is not None and self.api.user is not None and who != self.api.user.username:
+            self.notify_user("Presa in carico", ev.get("message", ""))
+
     def request_merge(self) -> None:
+        holder = self.dashboard.lock_holder()
+        if holder and not self.dashboard.lock_is_mine() and self.master_kind != "binary":
+            self._log(f"Attenzione: il Master è in carico a {holder} (avviso consultivo: la richiesta di merge è possibile)")
         if self.base_revision == 0:
             QMessageBox.information(self, "Checkout necessario", "Esegui prima il Checkout dell'ultimo Master.")
             return
@@ -547,40 +800,237 @@ class MainWindow(QMainWindow):
             self.open_proposal(d.id)
         self._run(lambda: api.submit_proposal(path, base, message), done, self._err)
 
+    # ================================================================ branch
+    def _reset_branches(self) -> None:
+        self.branches = []
+        if self.workspace_widget is not None and hasattr(self, "sidebar"):
+            self.sidebar.set_branches([], self.api.branch if self.api else None)
+
+    def load_branches(self) -> None:
+        """Ricarica l'elenco dei branch del progetto aperto (selettore, banner, «da main rev N, M indietro»)."""
+        api, proj = self.api, self.project
+        if api is None or proj is None or proj.head_revision is None or self.workspace_widget is None:
+            return
+        pid = proj.id
+
+        def ok(bs: list[BranchOut]) -> None:
+            if self.api is api and self.project is not None and self.project.id == pid:
+                self._branches_loaded(bs)
+
+        def fail(exc: Exception) -> None:
+            if isinstance(exc, ApiError) and exc.status in BRANCH_UNSUPPORTED:
+                return                                          # server senza i branch: solo il principale
+            self._quiet_err(exc)
+        self._run(lambda: api.branches(pid), ok, fail)
+
+    def _branches_loaded(self, bs: list[BranchOut]) -> None:
+        self.branches = list(bs)
+        cur = self.api.branch
+        if cur and not any(b.slug == cur for b in bs):          # eliminato da un altro utente
+            self._log(f"Il branch «{cur}» non esiste più: torno al principale")
+            self.select_branch(None)
+            return
+        self.sidebar.set_branches(self.branches, cur)
+        self._apply_project()
+
+    def select_branch(self, slug: Optional[str]) -> None:
+        """Cambia contesto: ``None`` / ``""`` = principale, altrimenti il branch ``slug``. Imposta ``api.branch``,
+        chiude le finestre di consenso aperte, ricarica dashboard / cronologia / richieste / lock e riconnette il
+        WebSocket al nuovo branch."""
+        api, proj = self.api, self.project
+        if api is None or proj is None:
+            return
+        slug = slug or None
+        if slug == api.branch:
+            self.sidebar.select_branch(slug)
+            return
+        for d in list(self.dialogs.values()):
+            d.close()
+        api.set_project(proj.id, slug)
+        self.dashboard.set_lock(None)
+        self.dashboard.set_proposals([])
+        self.dashboard.set_developers([])
+        self.sidebar.set_branches(self.branches, slug)
+        self._apply_project()
+        self._log(f"Ora lavori sul branch «{branch_display_name(self.branch, slug)}»" if slug else "Ora lavori sul principale")
+        self.ws.start(api.ws_url)                               # sottoscrizione agli eventi del nuovo branch
+        self.refresh_all()
+
+    def show_branches(self) -> Optional[BranchesDialog]:
+        """Apre l'elenco dei branch (nuovo, passa, aggiorna dal principale, unisci nel principale, chiudi, elimina)."""
+        api, proj = self.api, self.project
+        if api is None or proj is None or proj.head_revision is None:
+            return None
+        dlg = BranchesDialog(api, proj, self.project_role, api.branch, self._run, self)
+        dlg.switch_requested.connect(self.select_branch)
+        dlg.sync_requested.connect(lambda s: self.sync_branch(s))
+        dlg.merge_requested.connect(lambda s: self.merge_branch(s))
+        dlg.changed.connect(self.load_branches)
+        self.branches_dialog = dlg
+        dlg.exec()
+        return dlg
+
+    def _branch_by_slug(self, slug: str) -> Optional[BranchOut]:
+        return next((b for b in self.branches if b.slug == slug), None)
+
+    def sync_branch(self, slug: Optional[str] = None) -> None:
+        """«Aggiorna dal principale»: richiesta di merge DENTRO il branch con le novita' del principale. Si resta
+        nel branch e si apre la proposta."""
+        api = self.api
+        slug = slug or (api.branch if api else None)
+        if api is None or self.project is None or not slug or self.project_role < Role.DEVELOPER:
+            return
+        b = self._branch_by_slug(slug)
+        if b is not None and not abilities(b, self.project_role).sync:
+            self._log(f"Branch «{b.name}»: nessun aggiornamento da portare dal principale (o branch di sola lettura)")
+            return
+        label = branch_display_name(b, slug)
+
+        def done(d) -> None:
+            self._log(f"Aggiornamento dal principale: richiesta {d.id} nel branch «{label}» "
+                      f"({d.n_changes} modifiche, {d.n_conflicts} conflitti)")
+            if api.branch != slug:
+                self.select_branch(slug)
+            self.refresh_all()
+            self.open_proposal(d.id)
+        self._run(lambda: api.branch_sync(slug), done, self._err)
+
+    def merge_branch(self, slug: Optional[str] = None, message: Optional[str] = None) -> None:
+        """«Unisci nel principale»: richiesta di merge del branch NEL principale (consenso normale). Dopo l'invio si
+        passa al principale e si apre la proposta. ``message`` salta la domanda (test)."""
+        api = self.api
+        slug = slug or (api.branch if api else None)
+        if api is None or self.project is None or not slug or self.project_role < Role.DEVELOPER:
+            return
+        b = self._branch_by_slug(slug)
+        if b is not None and not abilities(b, self.project_role).merge:
+            self._log(f"Branch «{b.name}»: non puoi unirlo nel principale (sola lettura)")
+            return
+        label = branch_display_name(b, slug)
+        if not isinstance(message, str):
+            message, ok_ = QInputDialog.getMultiLineText(
+                self, "Unisci nel principale",
+                f"Il branch «{label}» verrà proposto al principale con una richiesta di merge (consenso normale).\n"
+                "Descrizione delle modifiche (facoltativa):")
+            if not ok_:
+                return
+        message = message.strip()
+
+        def done(d) -> None:
+            self._log(f"Unione nel principale: richiesta {d.id} per il branch «{label}» "
+                      f"({d.n_changes} modifiche, {d.n_conflicts} conflitti)")
+            self.select_branch(None)                            # la proposta vive nel principale
+            self.refresh_all()
+            self.open_proposal(d.id)
+        self._run(lambda: api.branch_merge(slug, message), done, self._err)
+
+    def commit_to_branch(self, path: Optional[str] = None, message: Optional[str] = None) -> None:
+        """«Salva su branch...»: salvataggio diretto di una nuova revisione nel TUO branch personale. ``path`` /
+        ``message`` saltano i dialoghi (test). Nei branch team il salvataggio passa da «Richiedi Merge»."""
+        api, proj, b = self.api, self.project, self.branch
+        if api is None or proj is None or b is None or not abilities(b, self.project_role).commit:
+            return
+        slug = b.slug
+        if not isinstance(path, str):
+            dlg = MergeRequestDialog(self.local_folder, self.working_file, self.base_revision, f"{proj.name} › {b.name}",
+                                     parent=self, ext=self.master_ext, kind=self.master_kind, name=self.master_name,
+                                     title="Salva su branch", heading_text=f"Quale file vuoi salvare nel branch «{b.name}»?",
+                                     ok_text="Salva nel branch")
+            if dlg.exec() != QDialog.Accepted or dlg.selected_path() is None:
+                return
+            path = str(dlg.selected_path())
+            if not isinstance(message, str):
+                message = dlg.message_text()
+        message = (message or "").strip()
+        if not message:
+            QMessageBox.warning(self, "Messaggio mancante", "Descrivi brevemente cosa stai salvando nel branch.")
+            return
+        ws, name, ext = self.local_folder, self.master_name, self.master_ext
+        base_key = self._base_key()
+
+        def work():
+            m = api.branch_commit(slug, Path(path), message)
+            try:                                                # la copia pulita della nuova testa: base della prossima modifica
+                with _FILES_LOCK:
+                    api.download_master(ref_path(ws, name, m.revision, ext), m.revision)
+                    hide_ref_dir(ws)
+                api.report_revision(m.revision)
+            except Exception:                                   # noqa: BLE001 - il salvataggio e' gia' avvenuto
+                pass
+            return m
+
+        def done(m) -> None:
+            self._log(f"Salvato nel branch «{b.name}»: nuova rev {m.revision}")
+            if self.api is api:
+                self.settings.setValue(base_key, m.revision)             # il file salvato e' ora la copia di lavoro
+                self.settings.setValue(base_key + "/file", str(path))
+                self._update_local_label()
+                self._prune_local((path,))
+                self.refresh_all()
+        self._run(work, done, self._err)
+
     def show_history(self) -> None:
         api = self.api
         if api is None:
             return
 
         def show(history) -> None:
-            dlg = HistoryDialog(history, self.project_role, self)
+            dlg = HistoryDialog(history, self.project_role, self,
+                                max_revisions=self.project.max_revisions if self.project else None)
+            if api.branch:
+                dlg.setWindowTitle(f"Storico revisioni del branch «{branch_display_name(self.branch, api.branch)}»")
+            self.history_dialog = dlg
             dlg.download_requested.connect(lambda rev: self._download_revision(rev))
             dlg.restore_requested.connect(lambda rev: self._restore(rev, dlg))
+            HistoryActions(dlg, api, self._run, on_status=self._log, on_error=self._err)     # confronta / etichetta / blocca
             dlg.exec()
         self._run(api.history, show, self._err)
 
-    def _download_revision(self, rev: int) -> None:
+    def _download_revision(self, rev: int, path: Optional[str] = None) -> None:
+        """Salva una revisione del Master (non cancella ne' sposta nulla dal PC). ``path`` serve ai test."""
         ext = self.master_ext
-        path, _ = QFileDialog.getSaveFileName(self, "Salva revisione", rev_filename(self.master_name, rev, ext),
-                                              f"File del progetto (*{ext});;Tutti i file (*)")
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getSaveFileName(self, "Salva revisione",
+                                                  revision_save_name(self.master_name, rev, ext),
+                                                  revision_save_filter(ext))
         if path:
             api = self.api
-            self._run(lambda: api.download_master(Path(path), rev),
-                      lambda _x: self._log(f"Master rev {rev} salvato in {path}"), self._err)
 
-    def _restore(self, rev: int, parent: QWidget) -> None:
-        text, ok = QInputDialog.getMultiLineText(
-            parent, "Ripristina revisione",
-            f"Verrà creata una nuova revisione con il contenuto della rev {rev}; la cronologia resta intatta.\n"
-            "Motivo (minimo 3 caratteri):")
-        if not ok or len(text.strip()) < 3:
-            return
+            def done(_x) -> None:
+                self._log(f"Master rev {rev} salvato in {path}")
+                self._prune_local((path,))                       # il file appena salvato non si tocca mai
+            self._run(lambda: api.download_master(Path(path), rev), done, self._err)
+
+    def _restore(self, rev: int, parent: QWidget, reason: Optional[str] = None) -> None:
+        """Rollback (solo Admin): la revisione ``rev`` diventa una NUOVA revisione del Master. ``reason`` salta la
+        domanda (test). Le revisioni eliminate dal server (limite) non si possono ripristinare."""
         api = self.api
+        if api is None or self.project_role < Role.ADMIN:
+            return
+        if not isinstance(reason, str):
+            reason, ok = QInputDialog.getMultiLineText(
+                parent, "Ripristina revisione",
+                f"Verrà creata una nuova revisione con il contenuto della rev {rev}; la cronologia resta intatta.\n"
+                f"Motivo (minimo {MIN_REASON} caratteri):")
+            if not ok:
+                return
+        reason = reason.strip()
+        if len(reason) < MIN_REASON:
+            QMessageBox.warning(self, "Motivo troppo breve", f"Indica un motivo di almeno {MIN_REASON} caratteri.")
+            return
 
         def done(m) -> None:
             self._log(f"Master ripristinato dalla rev {rev}: nuova rev {m.revision}")
+            self.load_projects()
             self.refresh_all()
-        self._run(lambda: api.restore(rev, text.strip()), done, self._err)
+            if isinstance(parent, HistoryDialog):                             # lo storico aperto mostra la nuova rev
+                def refill(h) -> None:
+                    try:
+                        parent.set_history(h)
+                    except RuntimeError:                                      # dialogo gia' chiuso
+                        pass
+                self._run(api.history, refill, self._quiet_err)
+        self._run(lambda: api.restore(rev, reason), done, self._err)
 
     def open_proposal(self, pid: str) -> None:
         if self.api is None:
@@ -589,6 +1039,8 @@ class MainWindow(QMainWindow):
         if dlg is None:
             dlg = ApprovalDialog(self.api, pid, my_role=self.project_role, run=self._run, parent=self,
                                  master_ext=self.master_ext, master_name=self.master_name)
+            if self.api.branch:
+                dlg.setWindowTitle(f"Richiesta di Merge · Consenso · branch «{branch_display_name(self.branch, self.api.branch)}»")
             dlg.setAttribute(Qt.WA_DeleteOnClose)
             dlg.destroyed.connect(lambda *_a, p=pid: self.dialogs.pop(p, None))
             dlg.proposal_changed.connect(lambda _d: self.refresh_all())
@@ -617,7 +1069,29 @@ class MainWindow(QMainWindow):
         t, msg, prop = ev.get("type"), ev.get("message", ""), ev.get("proposal")
         if t == "hello":
             return
+        if t == "project_deleted":
+            self._on_project_deleted(ev)
+            return
+        if t == "main_updated" or (t and str(t).startswith("branch_")):
+            # il principale e' avanzato (arriva ai client dei branch) oppure un branch e' stato creato / aggiornato /
+            # chiuso / unito / eliminato: cambiano «indietro» e stati, non i dati della vista corrente
+            self._log(msg)
+            self.load_branches()
+            return
+        if "branch" in ev and t != "project_updated":
+            ev_branch = ev.get("branch") or None                   # None / "" = principale
+            if ev_branch != self.api.branch:                       # evento di un altro branch: non riguarda questa vista
+                if t in ("master_updated", "proposal_merged"):     # ...ma puo' cambiare «indietro» dei branch
+                    self.load_branches()
+                return
         self._log(msg)
+        if t == "lock_changed":                                    # presa in carico / rilascio del Master
+            self._on_lock_changed(ev)
+            return
+        if t == "project_updated":                                 # nome / retention / policy cambiati dall'Admin
+            self.load_projects()
+            self.refresh_all()
+            return
         if t in ("developer_joined", "developer_left"):
             self._run(self.api.developers, self.dashboard.set_developers, self._quiet_err)
             return
@@ -627,6 +1101,8 @@ class MainWindow(QMainWindow):
             mine = any(p.get("session_id") == self.api.session_key for p in prop.get("participants", []))
             if mine and self.project_role >= Role.DEVELOPER:
                 self.open_proposal(prop["id"])                     # schermata di consenso per chi deve approvare
+        if t == "comment_added":
+            self._on_comment_added(ev)                             # notifica non bloccante (partecipante / @menzione)
         for dlg in list(self.dialogs.values()):
             dlg.on_event(ev)
         if t == "proposal_merged" and prop:
@@ -634,6 +1110,30 @@ class MainWindow(QMainWindow):
         if t == "master_updated" and ev.get("revision") is not None:
             self._auto_sync(int(ev["revision"]))
         self.refresh_all()
+
+    def _on_comment_added(self, ev: dict) -> None:
+        """Nuovo commento su una richiesta: avviso non bloccante se ne sono autore/partecipante o se sono @menzionato.
+        Nessun avviso per i miei stessi commenti; se la finestra della richiesta e' gia' aperta basta quella (salvo menzione)."""
+        api = self.api
+        if api is None or api.user is None:
+            return
+        me, who = api.user.username, ev.get("developer") or ""
+        if who == me:
+            return
+        prop = ev.get("proposal") or {}
+        mentioned = me in (ev.get("mentions") or [])
+        involved = bool(prop) and (prop.get("author_session") == api.session_key or any(
+            x.get("session_id") == api.session_key for x in prop.get("participants", [])))
+        if not (mentioned or involved):
+            return
+        dlg = self.dialogs.get(prop.get("id", ""))
+        if not mentioned and dlg is not None and dlg.isVisible():
+            return
+        if mentioned:
+            self._notify_all("Sei stato menzionato", f"{who} ti ha menzionato nella discussione della richiesta "
+                                                     f"#{prop.get('id', '')}.")
+        else:
+            self._notify_all("Nuovo commento", ev.get("message", ""))
 
     def _auto_sync(self, rev: int) -> None:
         """Distribuzione automatica: scarica il nuovo Master senza toccare la copia di lavoro."""
@@ -664,7 +1164,37 @@ class MainWindow(QMainWindow):
                           f"rev {self.base_revision}: fai Checkout per ripartire dal nuovo Master)")
             else:
                 self._log(f"Master rev {rev} scaricato in {dest}")
+            self._prune_local((dest,))
         self._run(work, ok, self._quiet_err)
+
+    # ------------------------------------------------------------ progetto eliminato dall'Admin
+    def _on_project_deleted(self, ev: dict) -> None:
+        """Evento ``project_deleted``: il progetto aperto non esiste piu' sul server. Si ferma tutto cio' che lo
+        riguarda (WebSocket, finestre di consenso), lo si toglie dall'elenco e si passa a un altro progetto o allo
+        stato «nessun progetto». I file locali dell'utente NON vengono toccati."""
+        if self.api is None:
+            return
+        gone = ev.get("project_id", ev.get("project"))
+        cur = self.project
+        if cur is None or (gone is not None and int(gone) != cur.id):
+            self.load_projects()                                   # un altro progetto: basta aggiornare l'elenco
+            return
+        name, folder = cur.name, self.project_folder
+        self.ws.stop()                                            # niente piu' eventi/riconnessioni del progetto morto
+        for d in list(self.dialogs.values()):
+            d.close()
+        self.projects = [p for p in self.projects if p.id != cur.id]
+        self.project = None
+        self.api.set_project(None)
+        if int(self.settings.value("project_id", 0) or 0) == cur.id:
+            self.settings.setValue("project_id", 0)
+        self.dashboard.set_proposals([])
+        self.dashboard.set_developers([])
+        self._projects_loaded(self.projects)                       # altro progetto disponibile oppure «nessun progetto»
+        self.load_projects()                                       # e riallineamento con il server
+        self._notify_all("Progetto eliminato",
+                         f"Il progetto «{name}» è stato eliminato dal server. I tuoi file locali non sono stati "
+                         f"toccati: restano in {folder}.")
 
     # ------------------------------------------------------------ reimport automatico dopo il mio merge
     def notify_user(self, title: str, text: str) -> None:

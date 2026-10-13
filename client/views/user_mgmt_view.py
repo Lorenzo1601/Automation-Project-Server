@@ -1,20 +1,25 @@
 """Gestione utenti, permessi di progetto, sessioni e ruoli (solo Admin)."""
 from __future__ import annotations
 
+import re
 import secrets
 import string
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QTabWidget,
-                               QVBoxLayout, QWidget)
+                               QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+                               QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from client.api_client import ApiClient, ApiError
 from client.theme.tokens import T
 from client.theme.widgets import Avatar, icon, role_color
-from client.views.project_dialogs import NewProjectDialog                  # noqa: F401 - riesportato
+from client.views.branches_dialog import BranchesDialog
+from client.views.history_actions import HistoryActions
+from client.views.history_dialog import MIN_REASON, HistoryDialog, revision_save_filter, revision_save_name
+from client.views.project_dialogs import DeleteProjectDialog, EditProjectDialog, NewProjectDialog   # noqa: F401
 from client.views.common import chip, full_time, h_line, heading, item, make_table, muted, role_chip, role_label
 from client.workers import run_async
 from common.filekinds import import_filters
@@ -156,6 +161,8 @@ class UserMgmtView(QWidget):
         self._users: list[UserOut] = []
         self._projects: list[ProjectOut] = []
         self._perms: list[PermissionOut] = []
+        self.history_dialog: Optional[HistoryDialog] = None             # ultimo storico aperto (utile ai test)
+        self.branches_dialog: Optional[BranchesDialog] = None           # ultimo elenco branch aperto (utile ai test)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(28, 24, 28, 20)
         lay.setSpacing(12)
@@ -307,6 +314,7 @@ class UserMgmtView(QWidget):
         opts.addWidget(self.proj_info)
         opts.addWidget(self.btn_archive)
         l.addLayout(opts)
+        l.addWidget(self._build_settings_box())
         l.addWidget(h_line())
         self.perm_table = make_table(["Utente", "Ruolo account", "Ruolo sul progetto", "Effettivo"], stretch_col=0)
         self.perm_table.setColumnWidth(1, 200)
@@ -321,6 +329,59 @@ class UserMgmtView(QWidget):
         self.btn_reimport.clicked.connect(self.reimport_master)
         self.chk_lead.clicked.connect(self._toggle_lead)
         self.btn_archive.clicked.connect(self.archive_project)
+
+    def _build_settings_box(self) -> QGroupBox:
+        """Gruppo «Impostazioni progetto»: modifica, storico/rollback, export, retention ed eliminazione."""
+        box = QGroupBox("Impostazioni progetto")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(14, 18, 14, 12)
+        v.setSpacing(10)
+        row1 = QHBoxLayout()
+        self.btn_edit_proj = QPushButton("  Modifica progetto...")
+        self.btn_edit_proj.setIcon(icon("sliders", T["TEXT"], 18))
+        self.btn_history = QPushButton("  Storico e rollback...")
+        self.btn_history.setIcon(icon("history", T["TEXT"], 18))
+        self.btn_history.setToolTip("Elenco delle revisioni del Master: scarica una revisione o ripristinala come "
+                                    "nuova revisione (rollback)")
+        self.btn_branches = QPushButton("  Branch...")
+        self.btn_branches.setIcon(icon("merge", T["TEXT"], 18))
+        self.btn_branches.setToolTip("Branch del progetto: elenco, nuovo, chiusura ed eliminazione "
+                                     "(per lavorare su un branch usa il selettore nella barra laterale)")
+        self.btn_export = QPushButton("  Esporta progetto (.zip)...")
+        self.btn_export.setIcon(icon("download", T["TEXT"], 18))
+        self.btn_export.setToolTip("Archivio con le revisioni ancora conservate, lo storico e l'audit del progetto")
+        self.btn_delete = QPushButton("  Elimina progetto...")
+        self.btn_delete.setIcon(icon("x", T["RED"], 18))
+        self.btn_delete.setProperty("variant", "danger")
+        self.btn_delete.setToolTip("Elimina definitivamente il progetto, i suoi file sul server e il suo audit")
+        for b in (self.btn_edit_proj, self.btn_history, self.btn_branches, self.btn_export):
+            row1.addWidget(b)
+        row1.addStretch(1)
+        row1.addWidget(self.btn_delete)
+        v.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Revisioni da conservare sul server"))
+        self.spin_revisions = QSpinBox()
+        self.spin_revisions.setRange(2, 200)
+        self.spin_revisions.setValue(10)
+        self.spin_revisions.setMinimumWidth(80)
+        self.btn_apply_revisions = QPushButton("Applica")
+        self.btn_apply_revisions.setEnabled(False)
+        self.lbl_retention = QLabel("")
+        self.lbl_retention.setProperty("muted", True)
+        row2.addWidget(self.spin_revisions)
+        row2.addWidget(self.btn_apply_revisions)
+        row2.addSpacing(8)
+        row2.addWidget(self.lbl_retention, 1)
+        v.addLayout(row2)
+        self.btn_edit_proj.clicked.connect(lambda: self.edit_project())
+        self.btn_history.clicked.connect(lambda: self.show_history())
+        self.btn_branches.clicked.connect(lambda: self.show_branches())
+        self.btn_export.clicked.connect(lambda: self.export_project())
+        self.btn_delete.clicked.connect(lambda: self.delete_project())
+        self.btn_apply_revisions.clicked.connect(lambda: self.apply_retention())
+        self.spin_revisions.valueChanged.connect(lambda _v: self._retention_changed())
+        return box
 
     def current_project(self) -> Optional[ProjectOut]:
         pid = self.proj_combo.currentData()
@@ -342,12 +403,22 @@ class UserMgmtView(QWidget):
     def _load_perms(self) -> None:
         p = self.current_project()
         has = p is not None
-        for wdg in (self.chk_lead, self.btn_archive, self.btn_init, self.btn_reimport):
+        for wdg in (self.chk_lead, self.btn_archive, self.btn_init, self.btn_reimport, self.btn_edit_proj,
+                    self.btn_export, self.btn_delete, self.spin_revisions):
             wdg.setEnabled(has)
+        self.btn_history.setEnabled(has and p.head_revision is not None)
+        self.btn_branches.setEnabled(has and p.head_revision is not None)
         if p is None:
             self.perm_table.setRowCount(0)
             self.proj_info.setText("Nessun progetto: creane uno.")
+            self.lbl_retention.setText("")
+            self.btn_apply_revisions.setEnabled(False)
             return
+        self.spin_revisions.blockSignals(True)
+        self.spin_revisions.setValue(max(self.spin_revisions.minimum(), min(self.spin_revisions.maximum(),
+                                                                          p.max_revisions)))
+        self.spin_revisions.blockSignals(False)
+        self._retention_changed()
         self.chk_lead.setChecked(p.require_lead_approval)
         self.btn_archive.setText("Ripristina" if p.archived else "Archivia")
         self.btn_init.setVisible(p.head_revision is None)
@@ -468,6 +539,218 @@ class UserMgmtView(QWidget):
             self.projects_changed.emit()
             self.reload()
         self._run(lambda: self.api.reimport_master_for(p.id, Path(path), reason), ok, self._err)
+
+    # ------------------------------------------------------------------ impostazioni progetto (solo Admin)
+    @staticmethod
+    def kept_revisions(p: ProjectOut) -> int:
+        """Revisioni del Master oggi conservate sul server (le altre sono state eliminate dal limite)."""
+        return max(0, (p.head_revision or 0) - (p.purged_revisions or 0))
+
+    def _retention_changed(self) -> None:
+        p = self.current_project()
+        if p is None:
+            return
+        self.btn_apply_revisions.setEnabled(self.spin_revisions.value() != p.max_revisions)
+        total = p.head_revision or 0
+        self.lbl_retention.setText(f"Conservate: {self.kept_revisions(p)} di {total} · "
+                                   f"limite attuale: {p.max_revisions}")
+
+    def edit_project(self, name: Optional[str] = None, description: Optional[str] = None) -> None:
+        """Modifica nome e/o descrizione. ``name``/``description`` (test) evitano la finestra di dialogo."""
+        p = self.current_project()
+        if p is None:
+            return
+        if name is None and description is None:
+            dlg = EditProjectDialog(p, self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            data = dlg.payload()
+        else:
+            name = p.name if name is None else name.strip()
+            desc = (p.description or "") if description is None else description.strip()
+            if not name:
+                QMessageBox.warning(self, "Nome mancante", "Il progetto deve avere un nome.")
+                return
+            data = ProjectUpdate(name=name if name != p.name else None,
+                                 description=desc if desc != (p.description or "") else None)
+        if data.name is None and data.description is None:
+            return                                                       # niente da salvare
+
+        def ok(x: ProjectOut) -> None:
+            self.status.emit(f"Progetto «{x.name}» aggiornato")
+            self.projects_changed.emit()
+            self.reload()
+        self._run(lambda: self.api.update_project(p.id, data), ok, self._err)
+
+    def apply_retention(self, value: Optional[int] = None, confirm: Optional[bool] = None) -> None:
+        """Imposta il numero di revisioni conservate dal server. Se e' inferiore a quelle oggi conservate chiede
+        conferma (``confirm`` e' per i test: True/False risponde al posto dell'utente)."""
+        p = self.current_project()
+        if p is None:
+            return
+        value = int(self.spin_revisions.value() if value is None else value)
+        if value == p.max_revisions:
+            return
+        kept = self.kept_revisions(p)
+        if value < kept:
+            n = kept - value
+            ok_ = confirm if isinstance(confirm, bool) else QMessageBox.question(
+                self, "Riduci le revisioni conservate",
+                f"Il limite passa da {p.max_revisions} a {value} revisioni.\n\n"
+                f"Verranno eliminate definitivamente dal server le {n} revisioni più vecchie "
+                f"(oggi ne sono conservate {kept}). Nello storico resteranno i dati (autore, data, messaggio) "
+                "ma quelle revisioni non si potranno più scaricare né ripristinare.\n\nProcedere?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+            if not ok_:                                                  # annullato: la vista torna al limite reale
+                self.spin_revisions.blockSignals(True)
+                self.spin_revisions.setValue(max(self.spin_revisions.minimum(), min(self.spin_revisions.maximum(),
+                                                                                    p.max_revisions)))
+                self.spin_revisions.blockSignals(False)
+                self._retention_changed()
+                return
+
+        def done(x: ProjectOut) -> None:
+            self.status.emit(f"«{x.name}»: il server conserverà le ultime {x.max_revisions} revisioni")
+            self.projects_changed.emit()
+            self.reload()
+        self._run(lambda: self.api.update_project(p.id, ProjectUpdate(max_revisions=value)), done, self._err)
+
+    # --- branch
+    def show_branches(self) -> None:
+        """Elenco dei branch del progetto selezionato (console Admin: elenco, nuovo, chiudi, elimina; il cambio di
+        contesto si fa dal selettore della barra laterale)."""
+        p = self.current_project()
+        if p is None or p.head_revision is None:
+            return
+        dlg = BranchesDialog(self.api, p, self.api.role, None, self._run, self, manage_only=True)
+        self.branches_dialog = dlg
+        dlg.exec()
+
+    # --- storico e rollback
+    def show_history(self) -> None:
+        """Apre lo storico del progetto selezionato (senza cambiare il progetto aperto nell'api condivisa)."""
+        p = self.current_project()
+        if p is None or p.head_revision is None:
+            return
+        api = self.api
+        self._run(lambda: api.history_for(p.id), lambda h: self._show_history(p, h), self._err)
+
+    def _show_history(self, p: ProjectOut, history: list) -> None:
+        dlg = HistoryDialog(history, Role.ADMIN, self, max_revisions=p.max_revisions)
+        self.history_dialog = dlg
+        dlg.download_requested.connect(lambda rev: self.download_revision(rev, project=p))
+        dlg.restore_requested.connect(lambda rev: self.rollback(rev, project=p, dialog=dlg))
+        HistoryActions(dlg, self.api, self._run, pid=p.id, on_status=self.status.emit, on_error=self._err)    # confronta / etichetta / blocca
+        dlg.exec()
+
+    def download_revision(self, rev: int, path: Optional[str] = None, project: Optional[ProjectOut] = None) -> None:
+        """Salva una revisione del Master (nome proposto ``<nome>_revN<ext>``, come il Checkout del client)."""
+        p = project or self.current_project()
+        if p is None:
+            return
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getSaveFileName(self, "Salva revisione",
+                                                  revision_save_name(p.master_name, rev, p.master_ext),
+                                                  revision_save_filter(p.master_ext))
+        if not path:
+            return
+        api = self.api
+        self._run(lambda: api.download_master_for(p.id, Path(path), rev),
+                  lambda _r: self.status.emit(f"«{p.name}»: rev {rev} salvata in {path}"), self._err)
+
+    def rollback(self, rev: int, reason: Optional[str] = None, project: Optional[ProjectOut] = None,
+                 dialog: Optional[HistoryDialog] = None) -> None:
+        """Rollback: ripristina la revisione ``rev`` come NUOVA revisione del Master (cronologia intatta).
+
+        ``reason`` (test) salta le domande; altrimenti chiede conferma e motivo (almeno 5 caratteri).
+        """
+        p = project or self.current_project()
+        if p is None:
+            return
+        if not isinstance(reason, str):
+            if QMessageBox.question(
+                    self, "Ripristina revisione",
+                    f"Verrà creata una NUOVA revisione del Master di «{p.name}» con il contenuto della rev {rev}.\n\n"
+                    "• la cronologia resta intatta: nessuna revisione viene cancellata;\n"
+                    "• i client vengono avvisati del nuovo Master;\n"
+                    "• l'operazione è registrata nell'audit.\n\nProcedere?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            reason, ok_ = QInputDialog.getMultiLineText(
+                self, "Ripristina revisione", f"Motivo del ripristino della rev {rev} (minimo {MIN_REASON} caratteri):")
+            if not ok_:
+                return
+        reason = reason.strip()
+        if len(reason) < MIN_REASON:
+            QMessageBox.warning(self, "Motivo troppo breve", f"Indica un motivo di almeno {MIN_REASON} caratteri.")
+            return
+        api = self.api
+
+        def done(m) -> None:
+            self.status.emit(f"«{p.name}» ripristinato dalla rev {rev}: nuova rev {m.revision}")
+            self.projects_changed.emit()
+            self.reload()
+            if dialog is not None:                                        # lo storico aperto mostra la nuova revisione
+                self._run(lambda: api.history_for(p.id), lambda h: dialog.set_history(h), self._err)
+        self._run(lambda: api.restore_for(p.id, rev, reason), done, self._err)
+
+    # --- export / eliminazione
+    @staticmethod
+    def _export_name(p: ProjectOut) -> str:
+        stem = re.sub(r"[^\w.-]+", "_", p.name).strip("_") or "progetto"
+        return f"{stem}_export_{datetime.now():%Y%m%d}.zip"
+
+    def export_project(self, path: Optional[str] = None) -> None:
+        """Esporta un archivio .zip del progetto (revisioni conservate, storico, audit CSV)."""
+        p = self.current_project()
+        if p is None:
+            return
+        if not isinstance(path, str):
+            path, _ = QFileDialog.getSaveFileName(self, "Esporta progetto", self._export_name(p),
+                                                  "Archivio zip (*.zip);;Tutti i file (*)")
+        if not path:
+            return
+        api = self.api
+        self._run(lambda: api.export_project(p.id, Path(path)),
+                  lambda _r: self.status.emit(f"Progetto «{p.name}» esportato in {path}"), self._err)
+
+    def delete_project(self, confirm_name: Optional[str] = None, export_to: Optional[str] = None) -> None:
+        """Elimina DEFINITIVAMENTE il progetto selezionato (file, revisioni, permessi, audit).
+
+        Senza argomenti mostra la conferma forte (nome da digitare + esportazione preventiva). ``confirm_name`` e
+        ``export_to`` (test) sostituiscono dialogo e scelta del file: ``export_to`` e' il .zip da creare PRIMA
+        dell'eliminazione (se l'export fallisce non viene eliminato nulla).
+        """
+        p = self.current_project()
+        if p is None:
+            return
+        if confirm_name is None:
+            dlg = DeleteProjectDialog(p, self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            confirm_name = dlg.typed_name()
+            if dlg.wants_export():
+                export_to, _ = QFileDialog.getSaveFileName(self, "Salva l'archivio prima di eliminare",
+                                                           self._export_name(p), "Archivio zip (*.zip);;Tutti i file (*)")
+                if not export_to:
+                    return                                                # niente archivio -> niente eliminazione
+        if confirm_name != p.name:
+            QMessageBox.warning(self, "Nome non corrispondente",
+                                "Il nome digitato non coincide con quello del progetto: nulla è stato eliminato.")
+            return
+        api, name, dest = self.api, p.name, (Path(export_to) if export_to else None)
+
+        def work():
+            if dest is not None:
+                api.export_project(p.id, dest)                            # se fallisce, non si elimina
+            return api.delete_project(p.id, confirm_name)
+
+        def ok(res) -> None:
+            extra = f" (archivio salvato in {dest})" if dest is not None else ""
+            self.status.emit(f"Progetto «{name}» eliminato: {res.audit_entries_removed} righe di audit rimosse{extra}")
+            self.projects_changed.emit()
+            self.reload()
+        self._run(work, ok, self._err)
 
     def _toggle_lead(self) -> None:
         p = self.current_project()

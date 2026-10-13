@@ -24,6 +24,7 @@ e vengono eseguiti dal threadpool di FastAPI.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 import uuid
@@ -35,9 +36,11 @@ from common.roles import Role
 from common.schemas import (ACTIVE_STATES, STATE_LABELS, ChangeOut, ConflictOut, DeveloperOut,
                             Event, MasterInfo, ParticipantOut, ProposalDetail, ProposalState,
                             ProposalSummary)
-from common.filekinds import KIND_LABELS, L5K, L5X, MERGEABLE, canonical_ext, detect_kind, l5k_controller_name
+from common.filekinds import (KIND_LABELS, L5K, L5X, MERGEABLE, PLCOPEN, canonical_ext, compatible_kinds, detect_kind,
+                              l5k_controller_name)
 from server.textmerge import merge_any
 from server.merger import L5XError, MergeResult, Resolution, parse_l5x
+from server.plcopen import plcopen_identity
 from server.notifier import EventSink, NullSink
 from server.storage import MasterStore, Revision
 
@@ -95,19 +98,33 @@ class Proposal:
     needs_lead: bool = False
     lead_approval: Optional[Approval] = None
     forced_by: Optional[str] = None
+    # Branch: ``kind`` = normal | sync («Aggiorna dal principale» dentro un branch) | merge («Unisci nel principale»),
+    # ``source_branch`` = slug del branch di origine di un merge nel principale, ``main_head`` = revisione del principale
+    # portata da un sync. ``base_data``: base del 3-way presa dal principale (invece che da una revisione di questo store).
+    # ``swap``: sync: il file caricato e' la testa del principale (lato «theirs») e «mine» e' la testa del branch.
+    meta: dict = field(default_factory=dict)
+    base_data: Optional[bytes] = None
+    swap: bool = False
 
 
 class SessionManager:
     def __init__(self, store: MasterStore, sink: Optional[EventSink] = None, ttl: float = 90.0,
                  clock: Callable[[], float] = time.time,
                  audit: Optional[Callable[[str, str, str, dict], None]] = None,
-                 require_lead_approval: bool = True):
+                 require_lead_approval: bool = True, max_revisions: int = 10):
         self.store, self.sink, self.ttl, self.clock = store, sink or NullSink(), ttl, clock
         self._audit_cb = audit
         self.require_lead_approval = require_lead_approval
+        self.max_revisions = max_revisions          # revisioni conservate sul disco (le piu' vecchie vengono potate)
         self._lock = threading.RLock()
         self._devs: dict[str, Developer] = {}
         self._proposals: dict[str, Proposal] = {}
+        self.comment_count: Callable[[str], int] = lambda _pid: 0     # n. commenti non eliminati (lo imposta il registry)
+        # ---- estensioni per i branch (impostate dal registry; i valori di default non cambiano il comportamento)
+        self.extra_protect: Callable[[], set[int]] = lambda: set()    # revisioni da non potare (basi dei branch aperti)
+        self.on_merged: Optional[Callable[[Proposal, Revision], None]] = None       # richiesta consolidata in una revisione
+        self.finalize_guard: Optional[Callable[[Proposal], Optional[str]]] = None   # motivo per annullare invece di consolidare
+        self.auto_approve = False       # branch personale: consenso del solo autore, dato in automatico se non ci sono conflitti
 
     def _log_audit(self, action: str, actor: str, target: str = "", **details) -> None:
         if self._audit_cb:
@@ -193,41 +210,63 @@ class SessionManager:
                     for d in self._devs.values() if d.last_seen != float("-inf")]
 
     # ================================================================ proposte
-    def submit(self, dev: Developer, data: bytes, base_revision: int, message: str = "") -> Proposal:
+    @staticmethod
+    def _run_merge(kind: str, base: bytes, incoming: bytes, head_bytes: bytes, swap: bool,
+                   resolutions: Optional[dict[str, Resolution]] = None) -> MergeResult:
+        """3-way: normale = (base, mine=file inviato, theirs=testa dello store); ``swap`` (sync di un branch):
+        mine = testa dello store (il branch) e theirs = file inviato (la testa del principale)."""
+        if swap:
+            return merge_any(kind, base, head_bytes, incoming, resolutions)
+        return merge_any(kind, base, incoming, head_bytes, resolutions)
+
+    def submit(self, dev: Developer, data: bytes, base_revision: int, message: str = "", *,
+               base_data: Optional[bytes] = None, meta: Optional[dict] = None, swap: bool = False) -> Proposal:
+        """Nuova richiesta di merge. ``base_data``: base del 3-way presa da fuori (sync di un branch: e' una revisione del
+        principale, ``base_revision`` ne e' solo il numero mostrato); ``meta``: vedi ``Proposal``; ``swap``: vedi ``_run_merge``."""
         with self._lock:
             if dev.role < Role.DEVELOPER:
                 raise SessionError(403, "I Viewer non possono inviare richieste di merge")
             if not self.store.initialized:
                 raise SessionError(409, "Master non inizializzato")
-            if not self.store.has_revision(base_revision):
-                raise SessionError(422, f"Revisione base {base_revision} inesistente")
+            if base_data is None:
+                if self.store.is_purged(base_revision):
+                    raise SessionError(409, f"La revisione base {base_revision} non e' piu' conservata dal server "
+                                            f"(ne tiene {self.max_revisions}): esegui il Checkout dell'ultimo Master, "
+                                            f"rifai le modifiche e rinvia")
+                if not self.store.has_revision(base_revision):
+                    raise SessionError(422, f"Revisione base {base_revision} inesistente")
             head = self.store.head()
             got = detect_kind(data)
-            if head.kind in MERGEABLE and got != head.kind:
+            if head.kind in MERGEABLE and not compatible_kinds(head.kind, got):
                 raise SessionError(422, f"Il file inviato e' di tipo «{KIND_LABELS[got]}» ma il Master del progetto e' "
                                         f"«{KIND_LABELS[head.kind]}» ({head.ext})")
             try:
-                result = merge_any(head.kind, self.store.read_revision(base_revision), data,
-                                   self.store.read_revision(head.revision))
+                base = base_data if base_data is not None else self.store.read_revision(base_revision)
+                result = self._run_merge(head.kind, base, data, self.store.read_revision(head.revision), swap)
             except L5XError as exc:
                 raise SessionError(422, str(exc)) from exc
-            if not result.changes and not result.conflicts:
+            if not result.changes and not result.conflicts and not (swap and result.upstream_changes):
                 raise SessionError(422, "Nessuna modifica da proporre rispetto al Master")
 
+            meta = dict(meta or {})
             for old in [p for p in self._proposals.values()
-                        if p.author_session == dev.session_id and p.state in ACTIVE_STATES]:
+                        if p.author_session == dev.session_id and p.state in ACTIVE_STATES
+                        and p.meta.get("kind", "normal") == meta.get("kind", "normal")
+                        and p.meta.get("source_branch") == meta.get("source_branch")]:
                 self._set_state(old, ProposalState.CANCELLED, "Sostituita da una nuova richiesta dello stesso autore")
                 self._notify_proposal("proposal_updated", old, f"Richiesta di {old.author} sostituita da una nuova")
 
             pid = uuid.uuid4().hex[:10]
             path = self.store.save_upload(pid, data)
             required = {dev.session_id: dev.name}
-            required.update({d.session_id: d.name for d in self._devs.values()
-                             if d.session_id != dev.session_id and d.role >= Role.DEVELOPER and self._alive(d)})
+            if not self.auto_approve:                     # branch personale: consenso del solo autore
+                required.update({d.session_id: d.name for d in self._devs.values()
+                                 if d.session_id != dev.session_id and d.role >= Role.DEVELOPER and self._alive(d)})
             p = Proposal(id=pid, author_session=dev.session_id, author=dev.name, base_revision=base_revision,
                          message=message, created_at=_now(), updated_at=_now(),
                          state=ProposalState.AWAITING_CONSENT, file_path=str(path), required=required,
-                         author_role=dev.role, needs_lead=self.require_lead_approval and dev.role < Role.LEAD)
+                         author_role=dev.role, needs_lead=self.require_lead_approval and not self.auto_approve and dev.role < Role.LEAD,
+                         meta=meta, base_data=base_data, swap=swap)
             self._proposals[pid] = p
             self._apply_result(p, result, head.revision, reason=None)
             units = ", ".join(result.touched_routines[:6]) or "il progetto"
@@ -235,9 +274,33 @@ class SessionManager:
             self._log_audit("merge_requested", dev.name, pid, base_revision=base_revision,
                             head_revision=head.revision, changes=len(result.changes),
                             conflicts=len(result.conflicts), units=result.touched_routines[:20],
-                            needs_lead_approval=p.needs_lead, message=message[:200])
+                            needs_lead_approval=p.needs_lead, message=message[:200],
+                            **({"request_kind": meta["kind"]} if meta.get("kind") else {}),
+                            **({"source_branch": meta["source_branch"]} if meta.get("source_branch") else {}))
             self._audit()
+            self._auto_approve(p)
             return p
+
+    def _auto_approve(self, p: Proposal) -> None:
+        """Branch personale: se non restano conflitti il consenso dell'autore e' dato in automatico (consolida subito)."""
+        if not self.auto_approve or p.state != ProposalState.AWAITING_CONSENT or (p.result and p.result.unresolved):
+            return
+        author = self._devs.get(p.author_session)
+        if author is not None:
+            self.approve(author, p.id, "Approvazione automatica (branch personale)")
+
+    def cancel_matching(self, pred: Callable[[Proposal], bool], reason: str, actor: str = "system") -> list[str]:
+        """Annulla le richieste attive per cui ``pred`` e' vera (es. il branch di origine e' cambiato). Ritorna gli id."""
+        with self._lock:
+            done: list[str] = []
+            for p in [p for p in self._proposals.values() if p.state in ACTIVE_STATES and pred(p)]:
+                self._set_state(p, ProposalState.CANCELLED, f"Annullata: {reason}")
+                self._notify_proposal("proposal_updated", p, f"Richiesta di {p.author} annullata: {reason}")
+                self._log_audit("merge_cancelled", actor, p.id, reason=reason[:200])
+                done.append(p.id)
+            if done:
+                self._audit()
+            return done
 
     def get(self, pid: str) -> Proposal:
         p = self._proposals.get(pid)
@@ -272,6 +335,7 @@ class SessionManager:
             self._log_audit("conflicts_resolved", dev.name, pid, resolved=sorted(resolutions),
                             by_admin=dev.session_id != p.author_session)
             self._audit()
+            self._auto_approve(p)
             return p
 
     # ---- consenso
@@ -359,6 +423,9 @@ class SessionManager:
         with self._lock:
             if dev.role < Role.ADMIN:
                 raise SessionError(403, "Solo un Project Administrator puo' ripristinare una revisione")
+            if self.store.is_purged(revision):
+                raise SessionError(422, f"La revisione {revision} non e' piu' conservata dal server (ne tiene "
+                                        f"{self.max_revisions}): si possono ripristinare solo le revisioni conservate")
             if not self.store.has_revision(revision):
                 raise SessionError(404, f"Revisione {revision} inesistente")
             head = self.store.head()
@@ -371,6 +438,7 @@ class SessionManager:
             self._broadcast("master_updated", f"Master ripristinato alla rev {revision} (nuova rev {rev.revision})",
                             revision=rev.revision)
             self._after_master_advance(rev.revision, skip=None)
+            self.prune_revisions(dev.name)
             return rev
 
     def reimport(self, dev: Developer, data: bytes, filename: str, reason: str):
@@ -389,27 +457,7 @@ class SessionManager:
             if not data:
                 raise SessionError(422, "Il file e' vuoto")
             head = self.store.head()
-            got = detect_kind(data)
-            if got != head.kind:
-                raise SessionError(422, f"Il file e' di tipo «{KIND_LABELS[got]}» ma il Master del progetto e' "
-                                        f"«{KIND_LABELS[head.kind]}» ({head.ext})")
-            try:
-                if got == L5X:
-                    new_ctrl = parse_l5x(data).find("Controller").get("Name")
-                    old_ctrl = parse_l5x(self.store.read_revision(head.revision)).find("Controller").get("Name")
-                elif got == L5K:
-                    new_ctrl = l5k_controller_name(data)
-                    old_ctrl = l5k_controller_name(self.store.read_revision(head.revision))
-                else:
-                    new_ctrl = old_ctrl = ""
-            except L5XError as exc:
-                raise SessionError(422, str(exc)) from exc
-            if got in (L5X, L5K) and new_ctrl != old_ctrl:
-                raise SessionError(422, f"Il file contiene il Controller «{new_ctrl}» ma il progetto e' «{old_ctrl}»: "
-                                        f"un Controller diverso e' un altro progetto")
-            if got not in (L5X, L5K) and canonical_ext(filename, got).lower() != head.ext.lower():
-                raise SessionError(422, f"L'estensione del file ({canonical_ext(filename, got)}) non corrisponde a quella "
-                                        f"del progetto ({head.ext})")
+            self._check_replacement(data, filename, head)
             if hashlib.sha256(data).hexdigest() == head.sha256:
                 raise SessionError(422, "Il file e' identico al Master corrente: nulla da reimportare")
             rev = self.store.commit(data, dev.name, f"Reimportazione del Master: {reason}", None,
@@ -420,7 +468,76 @@ class SessionManager:
             self._broadcast("master_updated", f"Master reimportato da {dev.name} (rev {rev.revision}): {reason}",
                             revision=rev.revision)
             self._after_master_advance(rev.revision, skip=None)
+            self.prune_revisions(dev.name)
             return rev
+
+    def _check_replacement(self, data: bytes, filename: str, head: Revision) -> None:
+        """File che sostituisce la testa (reimport, commit di un branch personale): stesso tipo, stesso Controller/progetto,
+        stessa estensione per i tipi senza identita'. Altrimenti ``SessionError`` 422."""
+        got = detect_kind(data)
+        if not compatible_kinds(head.kind, got):
+            raise SessionError(422, f"Il file e' di tipo «{KIND_LABELS[got]}» ma il Master del progetto e' "
+                                    f"«{KIND_LABELS[head.kind]}» ({head.ext})")
+        try:
+            if got == L5X:
+                new_ctrl = parse_l5x(data).find("Controller").get("Name")
+                old_ctrl = parse_l5x(self.store.read_revision(head.revision)).find("Controller").get("Name")
+            elif got == L5K:
+                new_ctrl = l5k_controller_name(data)
+                old_ctrl = l5k_controller_name(self.store.read_revision(head.revision))
+            elif got == PLCOPEN:
+                new_ctrl = plcopen_identity(data)
+                old_ctrl = plcopen_identity(self.store.read_revision(head.revision))
+            else:
+                new_ctrl = old_ctrl = ""
+        except L5XError as exc:
+            raise SessionError(422, str(exc)) from exc
+        if got == PLCOPEN and new_ctrl != old_ctrl:
+            raise SessionError(422, f"Il file contiene il progetto PLCopen «{new_ctrl[0]}» (azienda «{new_ctrl[1]}») ma il "
+                                    f"progetto e' «{old_ctrl[0]}» (azienda «{old_ctrl[1]}»): nome progetto e azienda "
+                                    f"devono coincidere, altrimenti e' un altro progetto")
+        if got in (L5X, L5K) and new_ctrl != old_ctrl:
+            raise SessionError(422, f"Il file contiene il Controller «{new_ctrl}» ma il progetto e' «{old_ctrl}»: "
+                                    f"un Controller diverso e' un altro progetto")
+        if got not in (L5X, L5K, PLCOPEN) and canonical_ext(filename, got).lower() != head.ext.lower():
+            raise SessionError(422, f"L'estensione del file ({canonical_ext(filename, got)}) non corrisponde a quella "
+                                    f"del progetto ({head.ext})")
+
+    def commit_direct(self, dev: Developer, data: bytes, filename: str, message: str) -> Revision:
+        """Salvataggio diretto di una nuova revisione (branch personale; i permessi li verifica chi chiama).
+
+        Stessi controlli del reimport (tipo compatibile, stesso Controller/progetto, stessa estensione, file non vuoto e
+        diverso dalla testa); le richieste in corso nel branch vengono rianalizzate. Non scrive l'audit (lo fa il chiamante).
+        """
+        with self._lock:
+            if not self.store.initialized:
+                raise SessionError(409, "Il branch non ha ancora nessuna revisione")
+            if not data:
+                raise SessionError(422, "Il file e' vuoto")
+            head = self.store.head()
+            self._check_replacement(data, filename, head)
+            if hashlib.sha256(data).hexdigest() == head.sha256:
+                raise SessionError(422, "Il file e' identico alla testa del branch: nulla da salvare")
+            rev = self.store.commit(data, dev.name, message, None, filename=filename)
+            self._broadcast("master_updated", f"Nuova revisione {rev.revision} nel branch ({dev.name})",
+                            revision=rev.revision)
+            self._after_master_advance(rev.revision, skip=None)
+            self.prune_revisions(dev.name)
+            return rev
+
+    def prune_revisions(self, actor: str = "system") -> list[int]:
+        """Pota le revisioni oltre ``max_revisions``, tenendo la testa e le basi delle richieste ATTIVE (servono al 3-way)."""
+        with self._lock:
+            if not self.store.initialized:
+                return []
+            protect = {p.base_revision for p in self._proposals.values()
+                       if p.state in ACTIVE_STATES and p.base_data is None}      # (con base_data la base non e' di questo store)
+            protect |= set(self.extra_protect())                                 # basi dei branch aperti (revisioni di fork)
+            gone = self.store.prune(self.max_revisions, protect)
+            if gone:
+                self._log_audit("revisions_pruned", actor, f"rev{gone[0]}-{gone[-1]}" if len(gone) > 1 else f"rev{gone[0]}",
+                                pruned=gone, keep=self.max_revisions)
+            return gone
 
     def housekeeping(self) -> None:
         """Da chiamare periodicamente: esclude dal quorum chi e' scaduto e rivaluta il consenso."""
@@ -439,6 +556,8 @@ class SessionManager:
     def _set_state(self, p: Proposal, st: ProposalState, log: str) -> None:
         p.state = st
         p.log.append(log)
+        if st not in ACTIVE_STATES and st != ProposalState.APPROVED:
+            p.base_data = None                               # la base del 3-way (copia in memoria) non serve piu'
         self._touch(p)
 
     def _apply_result(self, p: Proposal, result: MergeResult, head_rev: int, reason: Optional[str]) -> None:
@@ -457,9 +576,9 @@ class SessionManager:
         try:
             with open(p.file_path, "rb") as f:
                 mine = f.read()
-            res = merge_any(head.kind, self.store.read_revision(p.base_revision), mine,
-                            self.store.read_revision(head.revision), p.resolutions)
-        except L5XError as exc:                              # non dovrebbe accadere: i file erano gia' validi
+            base = p.base_data if p.base_data is not None else self.store.read_revision(p.base_revision)
+            res = self._run_merge(head.kind, base, mine, self.store.read_revision(head.revision), p.swap, p.resolutions)
+        except L5XError as exc:                             # non dovrebbe accadere: i file erano gia' validi
             self._set_state(p, ProposalState.CANCELLED, f"Errore di analisi: {exc}")
             return
         self._apply_result(p, res, head.revision, reason)
@@ -492,6 +611,12 @@ class SessionManager:
         self._finalize(p)
 
     def _finalize(self, p: Proposal, forced_by: Optional[str] = None, note: str = "") -> None:
+        if self.finalize_guard is not None and (why := self.finalize_guard(p)):
+            self._set_state(p, ProposalState.CANCELLED, f"Annullata: {why}")
+            self._notify_proposal("proposal_updated", p, f"Richiesta di {p.author} annullata: {why}")
+            self._log_audit("merge_cancelled", "system", p.id, reason=why[:200])
+            self._audit()
+            return
         head = self.store.head()
         if not forced_by and head.revision != p.analyzed_head:      # Master avanzato nel frattempo
             self._reanalyze(p, reason=f"Master avanzato a rev {head.revision}: analisi ripetuta")
@@ -511,8 +636,14 @@ class SessionManager:
                         approvers=sorted(a.developer for a in p.approvals.values() if a.decision == "approve"),
                         lead_approved_by=p.lead_approval.developer if p.lead_approval else None,
                         base_revision=p.base_revision, reason=note[:300] if forced_by else "")
+        if self.on_merged is not None:
+            try:
+                self.on_merged(p, rev)
+            except Exception:                                # noqa: BLE001  (il consolidamento e' gia' avvenuto)
+                logging.getLogger("aps.session").exception("Errore nel gancio on_merged della richiesta %s", p.id)
         self._broadcast("master_updated", f"Nuovo Master rev {rev.revision} ({p.author})", revision=rev.revision)
         self._after_master_advance(rev.revision, skip=p)
+        self.prune_revisions(forced_by or p.author)
 
     def _after_master_advance(self, rev: int, skip: Optional[Proposal]) -> None:
         for q in [q for q in self._proposals.values()
@@ -545,6 +676,7 @@ class SessionManager:
             touched=r.touched_routines if r else [], participants=self._participants(p),
             digest=r.digest if r else "", warnings=r.warnings if r else [], result_revision=p.result_revision,
             needs_lead_approval=p.needs_lead, forced_by=p.forced_by, author_role=p.author_role.key,
+            n_comments=self.comment_count(p.id),
             lead_approved_by=p.lead_approval.developer if (p.lead_approval and self._lead_ok(p)) else None)
 
     def detail(self, p: Proposal) -> ProposalDetail:
@@ -563,7 +695,8 @@ class SessionManager:
         h: Revision = self.store.head()
         return MasterInfo(revision=h.revision, sha256=h.sha256, updated_at=h.updated_at,
                           updated_by=h.updated_by, message=h.message, proposal_id=h.proposal_id,
-                          kind=h.kind, ext=h.ext, name=h.name or "Master")
+                          kind=h.kind, ext=h.ext, name=h.name or "Master",
+                          label=h.label, locked=h.locked, labeled_by=h.labeled_by, locked_by=h.locked_by)
 
     def _notify_proposal(self, typ: str, p: Proposal, message: str) -> None:
         targets = set(p.required) | {p.author_session}

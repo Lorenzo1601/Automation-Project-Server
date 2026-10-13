@@ -116,6 +116,15 @@ class ProjectOut(BaseModel):
     master_kind: Optional[str] = None           # tipo/estensione del Master (None finche' non e' inizializzato)
     master_ext: Optional[str] = None
     master_name: Optional[str] = None
+    max_revisions: int = 10                     # quante revisioni del Master tiene il server (decide l'Admin)
+    purged_revisions: int = 0                   # revisioni gia' eliminate dal server per rispettare il limite
+
+
+class ProjectDeleteOut(BaseModel):
+    id: int
+    name: str
+    audit_entries_removed: int = 0              # righe di audit del progetto cancellate
+    revisions_removed: int = 0                  # file di revisione cancellati dal disco del server
 
 
 class ProjectCreate(BaseModel):
@@ -123,9 +132,11 @@ class ProjectCreate(BaseModel):
     slug: Optional[str] = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
     description: str = ""
     require_lead_approval: bool = True
+    max_revisions: Optional[int] = Field(default=None, ge=2, le=200)    # None = predefinito del server (10)
 
 
 class ProjectUpdate(BaseModel):
+    max_revisions: Optional[int] = Field(default=None, ge=2, le=200)    # solo Admin; ridurre elimina le revisioni piu' vecchie
     name: Optional[str] = None
     description: Optional[str] = None
     require_lead_approval: Optional[bool] = None
@@ -181,9 +192,14 @@ class MasterInfo(BaseModel):
     updated_by: str
     message: str = ""
     proposal_id: Optional[str] = None
-    kind: str = "l5x"                  # l5x | l5k | text | binary (common.filekinds)
+    kind: str = "l5x"                  # l5x | l5k | plcopen | text | binary (common.filekinds)
     ext: str = ".L5X"                  # estensione del Master (fissata dal primo file importato)
     name: str = "Master"               # nome del file importato, senza estensione (i client lo mantengono)
+    purged: bool = False               # il file di questa revisione non e' piu' sul server (limite di revisioni): solo metadati
+    label: str = ""                    # etichetta libera della revisione (es. «FAT»), impostata da Lead/Admin
+    locked: bool = False               # revisione bloccata: mai eliminata dal limite di revisioni (sblocca solo l'Admin)
+    labeled_by: str = ""
+    locked_by: str = ""
 
 
 # ----------------------------------------------------------- diff / merge
@@ -265,6 +281,7 @@ class ProposalSummary(BaseModel):
     lead_approved_by: Optional[str] = None
     forced_by: Optional[str] = None         # Admin che ha forzato il merge
     author_role: str = ""
+    n_comments: int = 0            # commenti non eliminati della discussione sulla richiesta
 
 
 class ProposalDetail(ProposalSummary):
@@ -277,8 +294,18 @@ class ProposalDetail(ProposalSummary):
 class Event(BaseModel):
     type: str          # hello | proposal_submitted | proposal_updated | consent_given |
                        # proposal_rejected | proposal_merged | master_updated |
-                       # developer_joined | developer_left
+                       # developer_joined | developer_left | project_updated | project_deleted
+                       # (project_deleted: il progetto non esiste piu', il server chiude la connessione)
+                       # comment_added | comment_updated | comment_deleted (discussione: l'elenco si rilegge dall'API)
+                       # Branch: ogni evento di un branch porta il suo slug in ``branch`` e arriva solo ai client iscritti a
+                       # quel branch (WS ``?branch=<slug>``); gli eventi del principale hanno ``branch`` = None e arrivano
+                       # solo ai client del principale. Eccezioni:
+                       #   branch_created | branch_updated | branch_deleted  -> a TUTTI i client del progetto (la lista dei
+                       #       branch si rilegge da GET /branches); ``branch`` = slug interessato
+                       #   main_updated -> ai client dei branch: il principale e' avanzato (``revision``), «behind» cambia
     message: str = ""
     proposal: Optional[ProposalSummary] = None
     revision: Optional[int] = None
     developer: Optional[str] = None
+    mentions: list[str] = []       # comment_*: utenti @menzionati (esistenti e con accesso al progetto)
+    branch: Optional[str] = None   # slug del branch a cui si riferisce l'evento (None = principale)

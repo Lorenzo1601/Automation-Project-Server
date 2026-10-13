@@ -5,6 +5,8 @@ solo come si fa il merge:
 
 * ``l5x``    Rockwell XML (Studio 5000)   -> merge strutturale (Rung / Line / Tag ...)
 * ``l5k``    Rockwell ASCII (RSLogix 5000) -> merge testuale per riga, con contesto Program/Routine
+* ``plcopen`` PLCopen XML (TC6; export/import XML di CODESYS V3 e di altri IDE IEC 61131-3) -> merge strutturale
+              (POU, DUT, variabili, righe ST/IL, configurazioni)
 * ``text``   qualsiasi file di testo (es. ``.st``, ``.xml``, ``.project`` di altri IDE) -> merge testuale per riga
 * ``binary`` qualsiasi altro file       -> solo versionamento: le richieste di merge non sono possibili
 """
@@ -13,16 +15,23 @@ from __future__ import annotations
 import re
 from pathlib import PurePath
 
-L5X, L5K, TEXT, BINARY = "l5x", "l5k", "text", "binary"
-KINDS = (L5X, L5K, TEXT, BINARY)
+L5X, L5K, PLCOPEN, TEXT, BINARY = "l5x", "l5k", "plcopen", "text", "binary"
+KINDS = (L5X, L5K, PLCOPEN, TEXT, BINARY)
 
 ROCKWELL_EXTS = (".L5K", ".L5X")             # K = export ASCII, X = export XML
-MERGEABLE = (L5X, L5K, TEXT)
+MERGEABLE = (L5X, L5K, PLCOPEN, TEXT)
 
-KIND_LABELS = {L5X: "Rockwell L5X (XML)", L5K: "Rockwell L5K (ASCII)", TEXT: "File di testo", BINARY: "File binario"}
+KIND_LABELS = {L5X: "Rockwell L5X (XML)", L5K: "Rockwell L5K (ASCII)", PLCOPEN: "PLCopen XML (CODESYS)",
+               TEXT: "File di testo", BINARY: "File binario"}
 
 _IE_VER = re.compile(rb"(?m)^\s*IE_VER\s*:=")
 _L5K_CONTROLLER = re.compile(r"(?m)^\s*CONTROLLER\s+(\w+)\s*\(")
+# radice <project> (anche con prefisso) nel namespace PLCopen TC6, come primo elemento del documento
+_PLCOPEN_ROOT = re.compile(
+    rb"\A(?:\xef\xbb\xbf)?\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--.*?-->\s*)*"
+    rb"(?:<!DOCTYPE(?:[^>\[]|\[.*?\])*>\s*)?"              # un DOCTYPE si riconosce per poterlo RIFIUTARE (XXE)
+    rb"<(?:[\w.-]+:)?project(?=[\s>/])[^>]*?\sxmlns(?::[\w.-]+)?\s*=\s*[\"']http://www\.plcopen\.org/xml/tc6",
+    re.S)
 _HEAD = 8192
 
 
@@ -33,6 +42,8 @@ def detect_kind(data: bytes) -> str:
         return L5X
     if _IE_VER.search(head) and b"CONTROLLER" in data[:200_000]:
         return L5K
+    if b"plcopen.org" in head and _PLCOPEN_ROOT.match(head):
+        return PLCOPEN
     return BINARY if b"\x00" in data[:65536] else TEXT
 
 
@@ -45,7 +56,7 @@ def canonical_ext(filename: str, kind: str) -> str:
     ext = PurePath(filename or "").suffix
     ext = "".join(c for c in ext if c.isalnum() or c == ".")[:12]
     if len(ext) < 2:
-        ext = ".txt" if kind == TEXT else ".bin"
+        ext = ".xml" if kind == PLCOPEN else (".txt" if kind == TEXT else ".bin")
     return ext
 
 
@@ -55,7 +66,19 @@ def l5k_controller_name(data: bytes) -> str:
 
 
 def media_type(kind: str) -> str:
-    return {L5X: "application/xml", L5K: "text/plain", TEXT: "text/plain"}.get(kind, "application/octet-stream")
+    return {L5X: "application/xml", PLCOPEN: "application/xml", L5K: "text/plain", TEXT: "text/plain"}.get(kind, "application/octet-stream")
+
+
+PLCOPEN_FILTER = "PLCopen XML (*.xml *.XML)"
+
+
+def compatible_kinds(master_kind: str, got: str) -> bool:
+    """Un file di tipo ``got`` puo' essere proposto/reimportato su un Master di tipo ``master_kind``?
+
+    Stesso tipo; in piu' i progetti di testo creati prima del riconoscimento di PLCopen XML (un ``.xml`` PLCopen era
+    «File di testo») accettano ancora file che ora vengono riconosciuti come PLCopen.
+    """
+    return got == master_kind or (master_kind == TEXT and got == PLCOPEN)
 
 
 def file_dialog_filters(ext: str = "", kind: str = "") -> str:
@@ -64,13 +87,14 @@ def file_dialog_filters(ext: str = "", kind: str = "") -> str:
     if ext:
         out.append(f"File del progetto (*{ext.upper()} *{ext.lower()})")
     out.append("Rockwell (*.L5K *.L5X *.l5k *.l5x)")
+    out.append(PLCOPEN_FILTER)
     out.append("Tutti i file (*)")
     return ";;".join(out)
 
 
 def import_filters() -> str:
     """Filtri per scegliere il Master iniziale: tutti i file in testa, e Rockwell L5K/L5X a portata di mano."""
-    return "Tutti i file (*);;Rockwell (*.L5K *.L5X *.l5k *.l5x);;Rockwell L5K (*.L5K *.l5k);;Rockwell L5X (*.L5X *.l5x)"
+    return "Tutti i file (*);;Rockwell (*.L5K *.L5X *.l5k *.l5x);;Rockwell L5K (*.L5K *.l5k);;Rockwell L5X (*.L5X *.l5x);;" + PLCOPEN_FILTER
 
 
 # ----------------------------------------------------------------------------- nome del file del Master

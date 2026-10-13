@@ -15,10 +15,21 @@ TOKENS: dict[str, str] = {
     "SURFACE_3": "#363C4A",     # hover
     "BORDER": "#353B48",
     "BORDER_STRONG": "#4A5163",
+    # livelli aggiuntivi (gradienti sobri di schede, sidebar, pulsanti)
+    "SURFACE_TOP": "#282C36",   # scheda: parte alta del gradiente
+    "SURFACE_BOTTOM": "#22262E",  # scheda: parte bassa
+    "SIDEBAR_TOP": "#1C2027",
+    "SIDEBAR_BOTTOM": "#14171B",
+    "BORDER_SOFT": "#2C313C",
+    "FIELD_BG": "#171A1F",      # campi di input
+    "ROW_ALT": "#1F232A",       # riga alternata delle tabelle
     # accento
     "ACCENT": "#00E5FF",        # Industrial Cyan
     "ACCENT_ALT": "#007ACC",    # Electric Blue
     "ACCENT_DIM": "#0B3A47",    # fondo selezione
+    "ACCENT_HOVER": "#5CF0FF",
+    "ACCENT_PRESS": "#00BFD6",
+    "ACCENT_SOFT": "rgba(0, 229, 255, 28)",     # velo trasparente (voce attiva, focus)
     # stato & diff
     "GREEN": "#00E676",         # inserimenti / approvato
     "RED": "#FF5252",           # conflitti / eliminazioni
@@ -32,7 +43,9 @@ TOKENS: dict[str, str] = {
     "FILL_BG": "#1A1D22",       # riga di riempimento (lato senza controparte)
     # testo
     "TEXT": "#E0E6ED",
+    "TEXT_DIM": "#B3BCCB",      # testo secondario leggibile
     "MUTED": "#8A94A6",
+    "DISABLED": "#5A6376",
     "TEXT_ON_ACCENT": "#041418",
     # syntax highlighting (Logix / XML / ST)
     "SYN_INSTR": "#00E5FF",

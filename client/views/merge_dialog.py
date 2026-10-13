@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QVBoxLayout, QWidget)
 
 from client.localfiles import Candidate, find_merge_candidates, looks_like_kind, norm_ext, pick_default
 from client.theme.tokens import T
-from client.theme.widgets import icon
-from common.filekinds import L5K, L5X, file_dialog_filters
-from client.views.common import full_time, heading, item, make_table, muted
+from client.theme.widgets import icon, icon_pixmap
+from common.filekinds import L5K, L5X, PLCOPEN, file_dialog_filters
+from client.views.common import eyebrow, full_time, heading, item, make_table, muted
 
 
 def human_size(n: int) -> str:
@@ -28,22 +28,34 @@ def human_size(n: int) -> str:
 class MergeRequestDialog(QDialog):
     def __init__(self, folder: "str | Path", working_file: str, base_rev: int, project_name: str = "",
                  parent: Optional[QWidget] = None, scan: Callable[..., list[Candidate]] = find_merge_candidates,
-                 ext: str = ".L5X", kind: str = L5X, name: str = ""):
+                 ext: str = ".L5X", kind: str = L5X, name: str = "",
+                 title: str = "Richiedi Merge", heading_text: str = "Quale file vuoi unire al Master?",
+                 ok_text: str = "Invia richiesta"):
         super().__init__(parent)
         self.folder, self.working_file, self._scan = Path(folder), working_file, scan
         self.ext, self.kind, self.name, self.base_rev = norm_ext(ext), kind, name, base_rev
         self._cands: list[Candidate] = []
-        self.setWindowTitle("Richiedi Merge")
+        self.setWindowTitle(title)
         self.setMinimumSize(760, 520)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 20, 24, 16)
-        lay.setSpacing(10)
-        lay.addWidget(heading("Quale file vuoi unire al Master?", 2))
+        lay.setContentsMargins(28, 24, 28, 20)
+        lay.setSpacing(12)
+        lay.addWidget(heading(heading_text, 2))
+        bar = QFrame()
+        bar.setObjectName("InfoBar")
+        brow = QHBoxLayout(bar)
+        brow.setContentsMargins(14, 10, 14, 10)
+        brow.setSpacing(10)
+        fico = QLabel()
+        fico.setPixmap(icon_pixmap("folder", T["MUTED"], 18))
+        fico.setFixedWidth(22)
+        brow.addWidget(fico, 0, Qt.AlignTop)
         self.lbl_folder = QLabel(f"Cartella locale: <b>{self.folder}</b> &nbsp;·&nbsp; base: rev {base_rev}"
                                  + (f" &nbsp;·&nbsp; {project_name}" if project_name else ""))
         self.lbl_folder.setTextFormat(Qt.RichText)
         self.lbl_folder.setWordWrap(True)
-        lay.addWidget(self.lbl_folder)
+        brow.addWidget(self.lbl_folder, 1)
+        lay.addWidget(bar)
         self.lbl_hint = muted(f"Sono elencati i file {self.ext.upper()} della cartella (il Master scaricato e le sue copie "
                               "sono esclusi). Salva il lavoro in questa cartella e premi «Aggiorna»; per altri tipi di "
                               "file spunta «Mostra tutti i file».")
@@ -52,7 +64,7 @@ class MergeRequestDialog(QDialog):
         self.table = make_table(["File", "Modificato", "Dimensione", "Stato"], stretch_col=0)
         self.table.setColumnWidth(1, 150)
         self.table.setColumnWidth(2, 90)
-        self.table.setColumnWidth(3, 190)
+        self.table.setColumnWidth(3, 230)
         lay.addWidget(self.table, 1)
         self.info = QLabel("")
         self.info.setWordWrap(True)
@@ -72,14 +84,15 @@ class MergeRequestDialog(QDialog):
         row.addStretch(1)
         lay.addLayout(row)
 
-        lay.addWidget(QLabel("Descrizione delle modifiche"))
+        lay.addWidget(eyebrow("Descrizione delle modifiche"))
         self.message = QLineEdit()
         self.message.setPlaceholderText("es. Aggiunta logica del nastro N3")
         lay.addWidget(self.message)
 
+        lay.addSpacing(4)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.ok_btn = self.buttons.button(QDialogButtonBox.Ok)
-        self.ok_btn.setText("Invia richiesta")
+        self.ok_btn.setText(ok_text)
         self.ok_btn.setProperty("variant", "primary")
         self.buttons.button(QDialogButtonBox.Cancel).setText("Annulla")
         self.buttons.accepted.connect(self.accept)
@@ -167,7 +180,8 @@ class MergeRequestDialog(QDialog):
             self.info.setText("")
 
     def _kind_name(self) -> str:
-        return {L5X: "L5X (export XML di Studio 5000)", L5K: "L5K (export ASCII Rockwell)"}.get(self.kind, "del tipo del Master")
+        return {L5X: "L5X (export XML di Studio 5000)", L5K: "L5K (export ASCII Rockwell)",
+                PLCOPEN: "PLCopen XML (export XML di CODESYS)"}.get(self.kind, "del tipo del Master")
 
     def browse_other(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Seleziona il file da unire", str(self.folder),

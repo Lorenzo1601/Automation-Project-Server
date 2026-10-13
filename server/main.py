@@ -29,12 +29,16 @@ from server.config import Settings
 from server.db.audit import AuditService
 from server.db.base import Database
 from server.db.models import Project, User
-from common.filekinds import L5K, L5X, detect_kind, l5k_controller_name, media_type, rev_filename
+from common.filekinds import L5K, L5X, PLCOPEN, detect_kind, l5k_controller_name, media_type, rev_filename
 from server.merger import L5XError, Resolution, parse_l5x
+from server.plcopen import plcopen_identity
 from server.notifier import Notifier
-from server.projects import ProjectRegistry, ProjectRuntime
+from server.branches import build_router as branches_router, check_write as check_branch_write
+from server.projects import BranchNotFound, ProjectGone, ProjectRegistry, ProjectRuntime
 from server.projects import build_router as projects_router
+from server.revisions_ext import build_router as revisions_router
 from server.session_manager import Developer, SessionError
+from server.storage import RevisionPurged
 
 log = logging.getLogger("aps")
 
@@ -42,8 +46,9 @@ log = logging.getLogger("aps")
 @dataclass
 class Ctx:
     access: ProjectAccess
-    rt: ProjectRuntime
+    rt: ProjectRuntime            # runtime del principale o, con ``?branch=<slug>``, del branch
     dev: Developer
+    branch: Optional[str] = None  # slug del branch su cui opera la richiesta (None = principale)
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
@@ -66,8 +71,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         async def tick():
             while True:
                 await asyncio.sleep(15)
-                for pid in list(registry._rt):                                   # noqa: SLF001
-                    await run_in_threadpool(registry._rt[pid].mgr.housekeeping)   # noqa: SLF001
+                for rt in registry.runtimes():
+                    await run_in_threadpool(rt.mgr.housekeeping)
         task = asyncio.create_task(tick())
         yield
         task.cancel()
@@ -82,6 +87,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def _session_error(_, exc: SessionError):
         return JSONResponse(status_code=exc.status, content={"detail": exc.message})
 
+    @app.exception_handler(ProjectGone)
+    async def _project_gone(_, exc: ProjectGone):
+        return JSONResponse(status_code=404, content={"detail": "Progetto inesistente (in eliminazione)"})
+
+    @app.exception_handler(BranchNotFound)
+    async def _branch_gone(_, exc: BranchNotFound):
+        return JSONResponse(status_code=404, content={"detail": "Branch inesistente"})
+
     @app.exception_handler(AuthError)
     async def _auth_error(_, exc: AuthError):
         return JSONResponse(status_code=exc.status, content={"detail": exc.message})
@@ -94,20 +107,30 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {"status": "ok", "version": app.version}
 
     # --------------------------------------------------------------- contesto di progetto
-    def ctx(role: Role):
+    def ctx(role: Role, use_branch: bool = True):
+        """Contesto di progetto. Con ``?branch=<slug>`` (se ``use_branch``) il runtime e' quello del branch: le richieste
+        di scrittura (ruolo Developer+) sono permesse solo dove il branch e' aperto e scrivibile dall'utente."""
         access_dep = project_access(role)
 
-        def dep(ac: ProjectAccess = Depends(access_dep)) -> Ctx:
-            rt = registry.runtime(ac.project_id)
+        def dep(ac: ProjectAccess = Depends(access_dep), branch: Optional[str] = Query(None)) -> Ctx:
+            b = branch if (use_branch and branch) else None
+            rt = registry.runtime(ac.project_id, b)                  # BranchNotFound -> 404
+            if b and role >= Role.DEVELOPER:
+                check_branch_write(registry.branches.get(ac.project_id, b), ac.role, ac.principal.username)
             dev = rt.mgr.join(ac.principal.user_id, ac.principal.username, ac.role)
-            return Ctx(ac, rt, dev)
+            return Ctx(ac, rt, dev, b)
         return dep
 
     def rec(c: Ctx, action: str, target: str = "", **details) -> None:
+        if c.branch:
+            details = {**details, "branch": c.branch}
         audit.record(action, c.access.principal.username, project_id=c.access.project_id, target=target,
                      ip=c.access.principal.ip, details=details)
 
     P = "/api/projects/{pid}"
+
+    # confronto revisioni, etichette/blocco, lock esclusivo e check-in dei binari (server/revisions_ext.py)
+    app.include_router(revisions_router(ctx, audit, cfg))
 
     # -------------------------------------------------------------- master
     @app.post(P + "/master/init", response_model=MasterInfo, tags=["master"])
@@ -120,17 +143,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if len(data) > cfg.max_upload_mb * 1024 * 1024:
             raise HTTPException(413, "File troppo grande")
         kind = detect_kind(data)
-        controller = ""
+        controller = project_name = ""
         try:
             if kind == L5X:                           # un export Studio 5000 deve essere valido (intero Controller)
                 controller = parse_l5x(data).find("Controller").get("Name")
             elif kind == L5K:
                 controller = l5k_controller_name(data)
+            elif kind == PLCOPEN:                     # PLCopen XML: ben formato, senza DOCTYPE/entita', radice <project>
+                project_name = plcopen_identity(data)[0]
         except L5XError as exc:
             raise HTTPException(422, str(exc))
         rev = c.rt.store.commit(data, c.access.principal.username, "Revisione iniziale", filename=file.filename or "")
         rec(c, "master_initialized", f"rev{rev.revision}", sha256=rev.sha256, kind=rev.kind, ext=rev.ext, name=rev.name,
-            filename=(file.filename or "")[:120], **({"controller": controller} if controller else {}))
+            filename=(file.filename or "")[:120], **({"controller": controller} if controller else {}),
+            **({"project_name": project_name} if project_name else {}))
+        c.rt.mgr.prune_revisions(c.access.principal.username)
         return c.rt.mgr.master_info()
 
     @app.post(P + "/master/reimport", response_model=MasterInfo, tags=["master"])
@@ -158,6 +185,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def download(revision: Optional[int] = None, c: Ctx = Depends(ctx(Role.VIEWER))):
         try:
             data = c.rt.store.read_revision(revision)
+        except RevisionPurged as exc:
+            raise HTTPException(410, f"{exc}. Scarica una revisione conservata (vedi la cronologia del Master)")
         except LookupError as exc:
             raise HTTPException(404, str(exc))
         rev = revision if revision is not None else c.rt.store.head().revision
@@ -227,6 +256,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def force_merge(prop: str, body: DecisionIn, c: Ctx = Depends(ctx(Role.ADMIN))):
         return c.rt.mgr.detail(c.rt.mgr.force_merge(c.dev, prop, body.comment))
 
+    from server.comments import mount_comments                                        # discussione sulle richieste
+    mount_comments(app, ctx, registry, audit)
+
+    app.include_router(branches_router(ctx, registry, audit, cfg))                    # branch (server/branches.py)
+
     # --------------------------------------------------------------- audit
     def to_audit(r) -> AuditOut:                                                     # noqa: ANN001
         try:
@@ -259,7 +293,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     # ------------------------------------------------------------ websocket
     @app.websocket("/ws")
-    async def ws_endpoint(ws: WebSocket, token: str = "", project: int = 0):
+    async def ws_endpoint(ws: WebSocket, token: str = "", project: int = 0, branch: str = ""):
         try:
             p = await run_in_threadpool(auth.principal_from_access, token, ws.client.host if ws.client else "")
             if p.must_change_password:
@@ -272,16 +306,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             role = await run_in_threadpool(access)
             if role is None:
                 raise AuthError(403, "no access")
-            rt = await run_in_threadpool(registry.runtime, project)
+            rt = await run_in_threadpool(registry.runtime, project, branch or None)
         except (AuthError, LookupError):
             await ws.close(code=4401)
             return
         await ws.accept()
-        key = f"{project}:u{p.user_id}"
+        # chiave della connessione: principale "<pid>:u<id>", branch "<pid>:@<slug>:u<id>" (vedi server/notifier.py)
+        key = f"{project}:@{branch}:u{p.user_id}" if branch else f"{project}:u{p.user_id}"
         notifier.register(key, ws)
         dev = await run_in_threadpool(rt.mgr.join, p.user_id, p.username, role)
-        hello = Event(type="hello", message=f"Connesso come {p.username} ({role.label})",
-                      revision=rt.store.head().revision if rt.store.initialized else None)
+        hello = Event(type="hello", message=f"Connesso come {p.username} ({role.label})"
+                      + (f" al branch «{rt.branch_name}»" if branch else ""),
+                      revision=rt.store.head().revision if rt.store.initialized else None, branch=branch or None)
         await ws.send_json(hello.model_dump(mode="json"))
         await run_in_threadpool(rt.mgr.set_ws, dev.session_id, True)
         try:

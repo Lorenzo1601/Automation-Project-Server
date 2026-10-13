@@ -15,14 +15,15 @@ class ServerInfo:
     name: str
     host: str
     port: int
+    scheme: str = "http"                          # annunciato dal server (https se usa TLS); campo mancante = http
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"{self.scheme}://{self.host}:{self.port}"
 
     @property
     def label(self) -> str:
-        return f"{self.name}  ({self.host}:{self.port})"
+        return f"{self.name}  ({self.host}:{self.port})" + ("  [HTTPS]" if self.scheme == "https" else "")
 
 
 def local_ipv4() -> list[str]:
@@ -106,7 +107,7 @@ def discover(timeout: float = 1.5, udp_port: int = DISCOVERY_PORT,
                     key = r["id"] or f"{addr[0]}:{r['port']}"
                     cur = found.get(key)
                     if cur is None or (cur.host.startswith("127.") and not addr[0].startswith("127.")):
-                        found[key] = ServerInfo(r["name"], addr[0], r["port"])
+                        found[key] = ServerInfo(r["name"], addr[0], r["port"], r.get("scheme", "http"))
         return sorted(found.values(), key=lambda i: (i.name.lower(), i.host))
     finally:
         for s in socks:

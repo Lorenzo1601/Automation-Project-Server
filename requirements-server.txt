@@ -6,3 +6,4 @@ python-multipart>=0.0.9
 sqlalchemy>=2.0
 pyjwt>=2.8
 bcrypt>=4.1
+cryptography>=42

@@ -8,6 +8,7 @@ essere un percorso locale (es. ``D:\\APS``).
 Uso (da prompt dei comandi *come amministratore*; l'exe e' quello unico dell'applicazione, vedi ``server/launcher.py``)::
 
     start /wait "" AutomationProjectServer.exe install --data-dir D:\\APS [--port 8750] [--host 0.0.0.0] [--name "Linea 1"]
+                                                         [--tls [--tls-cert FILE.pem --tls-key FILE.key]]
     start /wait "" AutomationProjectServer.exe start | stop | restart | status | remove
     start /wait "" AutomationProjectServer.exe run        # in primo piano (prova senza installare), Ctrl+C per fermare
 
@@ -59,7 +60,8 @@ class ServiceRunner:
     def __init__(self, cfg: ServiceConfig) -> None:
         self.cfg = cfg
         self.server = EmbeddedServer(cfg.data_dir, cfg.host, cfg.port, name=cfg.name,
-                                     discovery_port=cfg.discovery_port, with_console=False)
+                                     discovery_port=cfg.discovery_port, with_console=False, tls_enabled=cfg.tls_enabled,
+                                     tls_certfile=cfg.tls_certfile, tls_keyfile=cfg.tls_keyfile)
         self._handler: Optional[logging.Handler] = None
         self._stop = threading.Event()
 
@@ -141,6 +143,14 @@ def install(cfg: ServiceConfig, admin_user: str = "admin", admin_password: Optio
     if err:
         raise OSError(err)
     lines: list[str] = []
+    if cfg.tls_enabled:                                  # errori di certificato subito, non al primo avvio del servizio
+        from server import tls as tlsmod
+        try:
+            mat = tlsmod.resolve_tls(data, True, cfg.tls_certfile, cfg.tls_keyfile)
+        except tlsmod.TlsError as exc:
+            raise ValueError(f"HTTPS non attivabile: {exc}") from exc
+        lines.append(("Generato il certificato autofirmato " if mat.generated else "Certificato HTTPS: ") + mat.certfile
+                     + f"\nImpronta SHA-256: {mat.info.fingerprint}")
     if not has_data(data):
         pw = admin_password or generate_password()
         boot = EmbeddedServer(data, cfg.host, cfg.port, admin_user=admin_user, admin_password=pw, with_console=False)
@@ -287,6 +297,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         p.add_argument("--port", type=int, default=None)
         p.add_argument("--name", default=None, help="nome mostrato ai client")
         p.add_argument("--discovery-port", type=int, default=None)
+        p.add_argument("--tls", dest="tls", action="store_true", default=None,
+                       help="HTTPS/WSS (certificato autofirmato in <dati>/tls se non si indica --tls-cert)")
+        p.add_argument("--no-tls", dest="tls", action="store_false", help="HTTP in chiaro")
+        p.add_argument("--tls-cert", default=None, metavar="FILE.pem", help="certificato PEM proprio (percorso locale)")
+        p.add_argument("--tls-key", default=None, metavar="FILE.key", help="chiave privata PEM senza password")
         if name == "install":
             p.add_argument("--admin-user", default="admin")
             p.add_argument("--admin-password", default=None)
@@ -308,7 +323,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             cfg = ServiceConfig(
                 data_dir=str(data), host=a.host or (base.host if base else "0.0.0.0"),
                 port=a.port or (base.port if base else 8750), name=a.name if a.name is not None else (base.name if base else ""),
-                discovery_port=a.discovery_port if a.discovery_port is not None else (base.discovery_port if base else DISCOVERY_PORT))
+                discovery_port=a.discovery_port if a.discovery_port is not None else (base.discovery_port if base else DISCOVERY_PORT),
+                tls_enabled=a.tls if a.tls is not None else (base.tls_enabled if base else False),
+                tls_certfile=a.tls_cert if a.tls_cert is not None else (base.tls_certfile if base else ""),
+                tls_keyfile=a.tls_key if a.tls_key is not None else (base.tls_keyfile if base else ""))
+            if not cfg.tls_enabled:
+                cfg.tls_certfile = cfg.tls_keyfile = ""
+            elif cfg.tls_certfile:                        # percorsi assoluti: il servizio gira come LocalSystem, altra cartella corrente
+                cfg.tls_certfile = str(Path(cfg.tls_certfile).resolve())
+                cfg.tls_keyfile = str(Path(cfg.tls_keyfile).resolve()) if cfg.tls_keyfile else ""
             if a.cmd == "run":
                 return run_foreground(cfg)
             print(install(cfg, a.admin_user, a.admin_password, firewall=not a.no_firewall, start=not a.no_start))

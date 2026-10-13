@@ -56,6 +56,7 @@ class Project(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     require_lead_approval: Mapped[bool] = mapped_column(Boolean, default=True)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_revisions: Mapped[int] = mapped_column(Integer, default=10, server_default="10")   # revisioni conservate dal server
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_by: Mapped[str] = mapped_column(String(64), default="")
 
@@ -114,12 +115,14 @@ class AuditLog(Base):
 
 
 # ---- immutabilita' dell'audit log: trigger SQLite + guardia ORM -----------------------------------
-event.listen(AuditLog.__table__, "after_create", DDL(
-    "CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log "
-    "BEGIN SELECT RAISE(ABORT, 'audit_log e'' immutabile'); END;").execute_if(dialect="sqlite"))
-event.listen(AuditLog.__table__, "after_create", DDL(
-    "CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log "
-    "BEGIN SELECT RAISE(ABORT, 'audit_log e'' immutabile'); END;").execute_if(dialect="sqlite"))
+AUDIT_TRIGGERS = {          # SQLite; ricreati identici da AuditService.purge_project dopo la manutenzione
+    "audit_no_update": "CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log "
+                       "BEGIN SELECT RAISE(ABORT, 'audit_log e'' immutabile'); END;",
+    "audit_no_delete": "CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log "
+                       "BEGIN SELECT RAISE(ABORT, 'audit_log e'' immutabile'); END;",
+}
+for _ddl in AUDIT_TRIGGERS.values():
+    event.listen(AuditLog.__table__, "after_create", DDL(_ddl).execute_if(dialect="sqlite"))
 
 
 @event.listens_for(AuditLog, "before_update")
@@ -134,3 +137,8 @@ def seed_roles(session) -> None:                                         # noqa:
         if int(role) not in have:
             session.add(RoleRow(name=ROLE_KEYS[role], rank=int(role), description=ROLE_DESCRIPTIONS[role]))
     session.flush()
+
+
+# ---- tabelle di altri moduli: registrate qui perche' ``create_all`` importi solo ``models``
+from server.db import models_comments  # noqa: E402,F401  (proposal_comments: discussione sulle richieste)
+from server.db import models_branches  # noqa: E402,F401  (branches: linee alternative del Master)

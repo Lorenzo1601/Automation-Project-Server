@@ -26,8 +26,18 @@ class Settings:
     max_upload_mb: int = field(default_factory=lambda: int(_env("APS_MAX_UPLOAD_MB", "200")))
     server_name: str = field(default_factory=lambda: _env("APS_SERVER_NAME", ""))        # nome mostrato ai client (default: PC)
     discovery_port: int = field(default_factory=lambda: int(_env("APS_DISCOVERY_PORT", "8751")))   # 0 = disattivata
+    default_max_revisions: int = field(default_factory=lambda: int(_env("APS_DEFAULT_MAX_REVISIONS", "10")))   # revisioni conservate per progetto
+    lock_ttl_h: float = field(default_factory=lambda: float(_env("APS_LOCK_TTL_H", "8")))    # durata della presa in carico (lock) del Master, in ore
     host: str = field(default_factory=lambda: _env("APS_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(_env("APS_PORT", "8750")))
+    # TLS (HTTPS + WSS). Senza certfile si usa/crea il certificato autofirmato in <data>/tls (vedi server/tls.py)
+    tls_enabled: bool = field(default_factory=lambda: _env("APS_TLS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"))
+    tls_certfile: str = field(default_factory=lambda: _env("APS_TLS_CERTFILE", ""))
+    tls_keyfile: str = field(default_factory=lambda: _env("APS_TLS_KEYFILE", ""))
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.tls_enabled else "http"
 
     @property
     def display_name(self) -> str:

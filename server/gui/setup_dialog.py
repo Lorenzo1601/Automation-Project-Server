@@ -132,6 +132,16 @@ class SetupDialog(QDialog):
         net.addWidget(self.port)
         lay.addLayout(net)
 
+        # HTTPS: attivo per default quando il server e' raggiungibile da tutta la rete (password e dati altrimenti in chiaro)
+        self.tls = QCheckBox("Usa HTTPS con certificato autofirmato")
+        self.tls.setToolTip("Cifra la connessione tra client e server. Il certificato viene creato in automatico nella "
+                            "cartella dei dati; i client ne mostrano l'impronta alla prima connessione.")
+        self.tls.setChecked(self.host.currentData() == "0.0.0.0")
+        self._tls_touched = False
+        self.tls.clicked.connect(lambda _c=False: setattr(self, "_tls_touched", True))
+        self.host.currentIndexChanged.connect(self._sync_tls_default)
+        lay.addWidget(self.tls)
+
         self.autostart = QCheckBox("Avvia il server automaticamente all'apertura dell'applicazione")
         self.autostart.setChecked(True)
         lay.addWidget(self.autostart)
@@ -160,6 +170,11 @@ class SetupDialog(QDialog):
         self.admin_box.setVisible(not ex)
         self.admin_title.setVisible(not ex)
         self.adjustSize()
+
+    def _sync_tls_default(self) -> None:
+        """Finche' l'utente non tocca la casella, HTTPS segue la scelta della rete (attivo con «Tutta la rete»)."""
+        if not self._tls_touched:
+            self.tls.setChecked(self.host.currentData() == "0.0.0.0")
 
     def _generate(self) -> None:
         pw = suggest_password()
@@ -193,7 +208,8 @@ class SetupDialog(QDialog):
     def values(self) -> dict:
         return {"base": self.folder.base(), "admin_user": self.admin_user.text().strip().lower(),
                 "admin_password": None if self.folder.existing() else self.pw.text(),
-                "host": self.host.currentData(), "port": self.port.value(), "autostart": self.autostart.isChecked()}
+                "host": self.host.currentData(), "port": self.port.value(), "autostart": self.autostart.isChecked(),
+                "tls": self.tls.isChecked()}
 
 
 class ChangeFolderDialog(QDialog):

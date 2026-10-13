@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (QButtonGroup, QDialog, QFileDialog, QFrame, QHBox
 from client.api_client import ApiClient, ApiError
 from client.theme.tokens import T
 from client.theme.widgets import Avatar, StatusBadge, badge_kind
+from client.views.comments_panel import CommentsPanel
 from client.views.common import chip, drop_widget, h_line, human_time, polish, role_chip
 from client.views.diff_viewer import DiffViewer, ThreeWayView
 from client.workers import run_async
@@ -245,8 +246,8 @@ class ApprovalDialog(QDialog):
         head = QFrame()
         head.setObjectName("Panel")
         hl = QVBoxLayout(head)
-        hl.setContentsMargins(18, 14, 18, 14)
-        hl.setSpacing(10)
+        hl.setContentsMargins(20, 16, 20, 16)
+        hl.setSpacing(12)
         top = QHBoxLayout()
         top.setSpacing(12)
         self.avatar_box = QHBoxLayout()
@@ -272,6 +273,7 @@ class ApprovalDialog(QDialog):
         hl.addLayout(top)
         self.lbl_msg = QLabel("")
         self.lbl_msg.setWordWrap(True)
+        self.lbl_msg.setStyleSheet("font-size:14px;")
         hl.addWidget(self.lbl_msg)
         hl.addWidget(h_line())
         self.people = QHBoxLayout()
@@ -293,6 +295,10 @@ class ApprovalDialog(QDialog):
         self.tabs.addTab(self.changes, "Modifiche")
         self.tabs.addTab(csp, "Conflitti")
         self.tabs.addTab(self.warn, "Avvisi")
+        self.comments = CommentsPanel(api, proposal_id, my_role=self.role, run=run)       # scheda «Discussione»
+        self.comments.count_changed.connect(self._comments_count)
+        self.tabs.addTab(self.comments, "Discussione")
+        self._comments_count(0)
 
         # ------------------------------------------------------------ piede
         self.btn_apply = QPushButton("Applica risoluzioni")
@@ -319,8 +325,8 @@ class ApprovalDialog(QDialog):
             foot.addWidget(b)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 18, 20, 16)
-        lay.setSpacing(12)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(14)
         lay.addWidget(head)
         lay.addWidget(self.tabs, 1)
         lay.addLayout(foot)
@@ -343,8 +349,14 @@ class ApprovalDialog(QDialog):
 
     def on_event(self, ev: dict) -> None:
         p = ev.get("proposal")
+        if str(ev.get("type", "")).startswith("comment_"):          # discussione: si aggiorna solo il pannello
+            self.comments.on_event(ev)
+            return
         if p and p.get("id") == self.pid:
             self.reload()
+
+    def _comments_count(self, n: int) -> None:
+        self.tabs.setTabText(self.tabs.indexOf(self.comments), f"Discussione ({n})" if n else "Discussione")
 
     @staticmethod
     def _clear(layout: QHBoxLayout) -> None:
@@ -383,6 +395,13 @@ class ApprovalDialog(QDialog):
         self.tabs.setTabText(1, f"Conflitti ({d.n_unresolved}/{d.n_conflicts})")
         self._fill_conflicts()
         self.warn.setPlainText("\n".join(d.warnings) or "Nessun avviso.")
+        self.comments.set_anchors([(ch.path, ch.path) for ch in d.changes]
+                                  + [(c.id, f"⚠ Conflitto · {c.path}") for c in d.conflicts])
+        if not self.comments.comments and d.n_comments:              # primo caricamento: badge subito, poi l'elenco
+            self._comments_count(d.n_comments)
+        if not getattr(self, "_comments_loaded", False):
+            self._comments_loaded = True
+            self.comments.reload()
         self.tabs.setTabText(2, f"Avvisi ({len(d.warnings)})")
         if d.conflicts and d.n_unresolved:
             self.tabs.setCurrentIndex(1)
@@ -408,9 +427,12 @@ class ApprovalDialog(QDialog):
     def _fill_people(self, d: ProposalDetail) -> None:
         self._clear(self.people)
         for p in d.participants:
-            box = QHBoxLayout()
-            box.setSpacing(8)
-            box.addWidget(Avatar(p.developer, 30, ring=DECISION_RING[p.decision]))
+            holder = QFrame()
+            holder.setObjectName("InfoBar")
+            box = QHBoxLayout(holder)
+            box.setContentsMargins(10, 7, 14, 7)
+            box.setSpacing(10)
+            box.addWidget(Avatar(p.developer, 32, ring=DECISION_RING[p.decision]))
             c = QVBoxLayout()
             c.setSpacing(0)
             n = QLabel(p.developer + (" (autore)" if p.is_author else ""))
@@ -423,8 +445,6 @@ class ApprovalDialog(QDialog):
             c.addWidget(n)
             c.addWidget(s)
             box.addLayout(c)
-            holder = QWidget()
-            holder.setLayout(box)
             self.people.addWidget(holder)
         if d.needs_lead_approval:
             self.people.addWidget(chip(f"Consenso Finale Lead ✔ {d.lead_approved_by}", T["GREEN"])

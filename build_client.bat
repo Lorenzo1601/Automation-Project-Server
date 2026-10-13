@@ -34,6 +34,8 @@ echo [4/4] Creazione eseguibile (puo' richiedere alcuni minuti)...
     --name AutomationProjectClient ^
     --icon "%ICON%" ^
     --paths . ^
+    --hidden-import cryptography.x509 ^
+    --collect-data certifi ^
     --specpath build ^
     --workpath build\client ^
     --distpath dist ^

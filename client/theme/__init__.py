@@ -27,7 +27,7 @@ def build_palette() -> QPalette:
     c = QColor
     p.setColor(QPalette.Window, c(T["BG_0"]))
     p.setColor(QPalette.WindowText, c(T["TEXT"]))
-    p.setColor(QPalette.Base, c(T["BG_1"]))
+    p.setColor(QPalette.Base, c(T["FIELD_BG"]))
     p.setColor(QPalette.AlternateBase, c(T["SURFACE_1"]))
     p.setColor(QPalette.Text, c(T["TEXT"]))
     p.setColor(QPalette.Button, c(T["SURFACE_2"]))
@@ -38,8 +38,8 @@ def build_palette() -> QPalette:
     p.setColor(QPalette.HighlightedText, c("#FFFFFF"))
     p.setColor(QPalette.PlaceholderText, c(T["MUTED"]))
     p.setColor(QPalette.Link, c(T["ACCENT"]))
-    p.setColor(QPalette.Disabled, QPalette.Text, c("#5A6376"))
-    p.setColor(QPalette.Disabled, QPalette.ButtonText, c("#5A6376"))
+    p.setColor(QPalette.Disabled, QPalette.Text, c(T["DISABLED"]))
+    p.setColor(QPalette.Disabled, QPalette.ButtonText, c(T["DISABLED"]))
     return p
 
 

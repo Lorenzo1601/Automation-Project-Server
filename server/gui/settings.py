@@ -59,3 +59,36 @@ class ServerPrefs:
     @server_name.setter
     def server_name(self, v: str) -> None:
         self.qs.setValue("server_name", v)
+
+    # --- connessione sicura (HTTPS): vedi server/tls.py. tls_mode: "self" (autofirmato in <dati>/tls) | "custom" (PEM dell'utente)
+    @property
+    def tls_enabled(self) -> bool:
+        return str(self.qs.value("tls_enabled", "false")).lower() in ("true", "1")
+
+    @tls_enabled.setter
+    def tls_enabled(self, v: bool) -> None:
+        self.qs.setValue("tls_enabled", bool(v))
+
+    @property
+    def tls_mode(self) -> str:
+        return "custom" if str(self.qs.value("tls_mode", "self")) == "custom" else "self"
+
+    @tls_mode.setter
+    def tls_mode(self, v: str) -> None:
+        self.qs.setValue("tls_mode", "custom" if v == "custom" else "self")
+
+    @property
+    def tls_certfile(self) -> str:
+        return str(self.qs.value("tls_certfile", "") or "")
+
+    @tls_certfile.setter
+    def tls_certfile(self, v: str) -> None:
+        self.qs.setValue("tls_certfile", v or "")
+
+    @property
+    def tls_keyfile(self) -> str:
+        return str(self.qs.value("tls_keyfile", "") or "")
+
+    @tls_keyfile.setter
+    def tls_keyfile(self, v: str) -> None:
+        self.qs.setValue("tls_keyfile", v or "")
