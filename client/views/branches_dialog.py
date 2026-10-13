@@ -105,6 +105,7 @@ class NewBranchDialog(QDialog):
 
 # ======================================================================================= elenco
 class BranchesDialog(QDialog):
+    created_branch = Signal(str)         # slug del branch appena creato (la finestra principale ci passa e ne scarica la copia)
     switch_requested = Signal(str)       # slug del branch a cui passare ("" = principale)
     sync_requested = Signal(str)         # «Aggiorna dal principale» su questo branch
     merge_requested = Signal(str)        # «Unisci nel principale» per questo branch
@@ -319,6 +320,7 @@ class BranchesDialog(QDialog):
             self.changed.emit()
             self.created = b
             self.reload()
+            self.created_branch.emit(b.slug)
         self._run(lambda: api.create_branch(name, kind, rev, pid), done, self._err)
 
     # ------------------------------------------------------------------ dialoghi (sostituibili)

@@ -441,6 +441,8 @@ def test_branches_dialog_actions_call_the_server(qapp, monkeypatch):
     dlg.sync_requested.connect(seen["sync"].append)
     dlg.merge_requested.connect(seen["merge"].append)
     dlg.changed.connect(lambda: seen.__setitem__("changed", seen["changed"] + 1))
+    created_slugs = []
+    dlg.created_branch.connect(created_slugs.append)
 
     # nuovo branch: dialogo sostituito da un hook; l'elenco delle revisioni arriva dal PRINCIPALE (mai ?branch=)
     asked = []
@@ -451,6 +453,7 @@ def test_branches_dialog_actions_call_the_server(qapp, monkeypatch):
     created = json.loads(srv.last("POST", "/branches")[3])
     assert created == {"name": "Nuova Logica", "kind": "personal", "from_revision": 2}
     assert dlg.created.slug == "nuova-logica" and seen["changed"] == 1
+    assert created_slugs == ["nuova-logica"]                                                  # la finestra principale ci passa e scarica la copia
     assert any(b.slug == "nuova-logica" for b in dlg._rows)
     dlg.ask_new = lambda revs, mine: None                                                  # annullato: nessuna chiamata
     n = len(srv.calls)
@@ -661,6 +664,26 @@ def test_branches_window_dialog_wiring(qapp, tmp_path, monkeypatch):
     win.dashboard.btn_branches.click()
     assert shown == {"role": Role.DEVELOPER, "cur": None, "rows": ["mio"]} and win.api.branch == "mio"
     assert win.branches_dialog is not None
+    win.close()
+
+
+def test_new_branch_creates_local_folder_with_export(qapp, tmp_path, monkeypatch):
+    """Regressione: dopo «Nuovo branch» la cartella locale <progetto>/branches/<slug>/ esiste subito, con l'export della
+    revisione di partenza e la copia pulita in .aps."""
+    srv = FakeServer(branches=[])
+    win = make_window(tmp_path, monkeypatch, srv)
+    base = tmp_path / "proj"
+
+    def fake_exec(self):
+        self.ask_new = lambda revs, mine: ("Prova", "personal", None)
+        self.new_branch()
+        return QDialog.Accepted
+    monkeypatch.setattr(BranchesDialog, "exec", fake_exec)
+    win.show_branches()
+    ws = base / "branches" / "prova"
+    assert win.api.branch == "prova" and win.local_folder == ws
+    assert ws.is_dir() and list(ws.glob("Master_rev*.L5X")) and list((ws / ".aps").glob("Master_rev*.L5X"))
+    assert win.working_file and Path(win.working_file).parent == ws
     win.close()
 
 

@@ -867,9 +867,23 @@ class MainWindow(QMainWindow):
         dlg.sync_requested.connect(lambda s: self.sync_branch(s))
         dlg.merge_requested.connect(lambda s: self.merge_branch(s))
         dlg.changed.connect(self.load_branches)
+        dlg.created_branch.connect(self.on_branch_created)
         self.branches_dialog = dlg
         dlg.exec()
         return dlg
+
+    def on_branch_created(self, slug: str) -> None:
+        """Dopo «Nuovo branch»: passa al branch e scarica subito la sua copia di lavoro, cosi' sul PC compare la cartella
+        ``<cartella progetto>/branches/<slug>/`` con l'export della revisione da cui parte (e la copia pulita in ``.aps``)."""
+        if self.api is None or self.project is None:
+            return
+        self.select_branch(slug)
+        if self.api.branch != slug:
+            return
+        if self.project.head_revision is None:
+            return
+        self.checkout()
+        self._log(f"Branch creato: cartella locale {self.local_folder}")
 
     def _branch_by_slug(self, slug: str) -> Optional[BranchOut]:
         return next((b for b in self.branches if b.slug == slug), None)
