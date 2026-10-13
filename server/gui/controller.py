@@ -375,5 +375,28 @@ class EmbeddedServer:
         self._glog.info("Backup creato: %s (%d byte)", info["path"], info["bytes"])
         return Path(info["path"])
 
+    def client_update(self):
+        """Client attualmente pubblicato per l'aggiornamento automatico (``UpdateInfo``; ``version`` vuota = nessuno)."""
+        from server.updates import read_info
+        return read_info(self.data_dir)
+
+    def publish_client_update(self, exe: "str | Path", version: str, notes: str = ""):
+        """Pubblica ``exe`` come ultima versione del client: i client collegati la proporranno all'avvio."""
+        from server.updates import publish
+        self.open()
+        info = publish(self.data_dir, Path(exe), version, notes, actor="console")
+        self.app.state.audit.record("client_update_published", "console", target=info.version,
+                                    details={"sha256": info.sha256, "size": info.size, "filename": info.filename})
+        self._glog.info("Aggiornamento del client pubblicato: %s", info.version)
+        return info
+
+    def remove_client_update(self) -> bool:
+        from server.updates import remove
+        self.open()
+        done = remove(self.data_dir)
+        if done:
+            self.app.state.audit.record("client_update_removed", "console")
+        return done
+
     def connections(self) -> int:
         return self.app.state.notifier.connection_count() if self.app is not None else 0

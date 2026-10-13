@@ -15,6 +15,21 @@ from client.theme.widgets import role_color
 from common.roles import ROLE_LABELS, Role
 
 
+def preview_html(p, what: str = "il merge") -> str:
+    """Riassunto HTML di un'anteprima (dry-run, ``PreviewOut``) per le etichette/le finestre del client."""
+    if p.nothing_to_merge:
+        return f"<span style='color:{T['ORANGE']}'>Nessuna differenza: non c'è nulla da unire.</span>"
+    if p.clean:
+        head = (f"<span style='color:{T['GREEN']}'><b>Nessun conflitto</b></span>: {what} procederebbe senza interventi "
+                f"({p.n_changes} modifiche")
+        head += f", {p.n_upstream} novità dall'altra parte)." if p.n_upstream else ")."
+        return head
+    rows = "".join(f"<li>{c.title or c.path} <span style='color:{T['MUTED']}'>({c.kind})</span></li>" for c in p.conflicts[:12])
+    more = f"<li>… e altri {p.n_conflicts - 12}</li>" if p.n_conflicts > 12 else ""
+    return (f"<span style='color:{T['RED']}'><b>{p.n_conflicts} conflitti</b></span> da risolvere ({p.n_changes} modifiche, "
+            f"{p.n_upstream} novità dall'altra parte):<ul>{rows}{more}</ul>")
+
+
 def human_time(dt: Optional[datetime]) -> str:
     """'12:31 · 5 min fa' (ora locale)."""
     if dt is None:

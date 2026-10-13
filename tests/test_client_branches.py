@@ -91,6 +91,10 @@ class FakeServer:
                        "user": u.model_dump(mode="json")})
         if path in ("/api/auth/logout", "/api/auth/me") or path.endswith("/heartbeat"):
             return ok({})
+        if path == "/api/client/update":
+            return ok({"available": False})
+        if path == "/api/notifications/count":
+            return ok({"unread": 0})
         if path == "/api/users":
             return ok([UserOut(id=2, username=self.username, display_name="X", role=self.role).model_dump(mode="json")])
         if path == "/api/projects":

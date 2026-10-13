@@ -1179,3 +1179,39 @@ def test_team_save_merges_three_way_without_vote_and_keeps_colleague_work(tworld
     assert c.post(B(pid, "mio", "/save"), headers=H["dev1"], data={"message": "x"}, files=f(l2="x")).status_code == 422
     assert c.post(B(pid, "squadra", "/save"), headers=H["viewer"], data={"message": "x"}, files=f(l2="y")).status_code == 403
     assert [a["details"]["message"] for a in audit(c, H, pid, "branch_committed")][:2]
+
+
+# =================================================================================== anteprima (dry-run)
+def test_dry_run_merge_and_sync_do_not_create_anything(tworld):
+    c, app, pid, H, _ = tworld
+    mk(c, pid, H["dev1"], "prova")
+    commit(c, pid, H["dev1"], "prova", text_master(l4="versione branch", l6="solo branch"))
+    main_bump(c, pid, H["lead"], 1, l4="versione principale")
+    # merge: l4 in conflitto, l6 pulita
+    r = c.post(B(pid, "prova", "/dry-run"), headers=H["dev1"], data={"mode": "merge"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["n_conflicts"] == 1 and not d["clean"] and d["n_changes"] >= 1 and d["conflicts"][0]["kind"]
+    assert c.get(f"/api/projects/{pid}/proposals", headers=H["dev1"]).json() == []       # nessuna richiesta creata
+    assert head_of(c, pid, H["dev1"]) == 2
+    # sync: stessa situazione vista dal branch
+    d = c.post(B(pid, "prova", "/dry-run"), headers=H["dev1"], data={"mode": "sync"}).json()
+    assert d["n_conflicts"] == 1 and d["n_upstream"] >= 1
+    assert c.get(f"/api/projects/{pid}/proposals?branch=prova", headers=H["dev1"]).json() == []
+    # un file diverso inviato nell'anteprima del merge
+    ok = c.post(B(pid, "prova", "/dry-run"), headers=H["dev1"], data={"mode": "merge"},
+                files={"file": ("m.txt", text_master(l6="altra modifica"))}).json()
+    assert ok["clean"] and ok["n_changes"] == 1
+    assert c.post(B(pid, "prova", "/dry-run"), headers=H["dev1"], data={"mode": "boh"}).status_code == 422
+    assert c.post(B(pid, "prova", "/dry-run"), headers=H["viewer"], data={"mode": "merge"}).status_code == 403
+
+
+def test_dry_run_plain_proposal(tworld):
+    c, app, pid, H, _ = tworld
+    r = c.post(f"/api/projects/{pid}/proposals/dry-run", headers=H["dev1"], data={"base_revision": 1},
+               files={"file": ("m.txt", text_master(l2="x"))})
+    assert r.status_code == 200 and r.json()["clean"] and r.json()["n_changes"] == 1
+    assert c.get(f"/api/projects/{pid}/proposals", headers=H["dev1"]).json() == []
+    same = c.post(f"/api/projects/{pid}/proposals/dry-run", headers=H["dev1"], data={"base_revision": 1},
+                  files={"file": ("m.txt", text_master())}).json()
+    assert same["nothing_to_merge"]

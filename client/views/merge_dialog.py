@@ -14,7 +14,12 @@ from client.localfiles import Candidate, find_merge_candidates, looks_like_kind,
 from client.theme.tokens import T
 from client.theme.widgets import icon, icon_pixmap
 from common.filekinds import L5K, L5X, PLCOPEN, file_dialog_filters
-from client.views.common import eyebrow, full_time, heading, item, make_table, muted
+from client.views.common import eyebrow, full_time, heading, item, make_table, muted, preview_html
+from client.workers import run_async
+
+
+def muted_html(text: str) -> str:
+    return f"<span style='color:{T['MUTED']}'>{text}</span>"
 
 
 def human_size(n: int) -> str:
@@ -30,8 +35,10 @@ class MergeRequestDialog(QDialog):
                  parent: Optional[QWidget] = None, scan: Callable[..., list[Candidate]] = find_merge_candidates,
                  ext: str = ".L5X", kind: str = L5X, name: str = "",
                  title: str = "Richiedi Merge", heading_text: str = "Quale file vuoi unire al Master?",
-                 ok_text: str = "Invia richiesta"):
+                 ok_text: str = "Invia richiesta", check_fn: Optional[Callable[[Path], object]] = None,
+                 run: Callable = run_async):
         super().__init__(parent)
+        self._check_fn, self._run = check_fn, run
         self.folder, self.working_file, self._scan = Path(folder), working_file, scan
         self.ext, self.kind, self.name, self.base_rev = norm_ext(ext), kind, name, base_rev
         self._cands: list[Candidate] = []
@@ -78,6 +85,11 @@ class MergeRequestDialog(QDialog):
         self.btn_other.setIcon(icon("folder", T["TEXT"], 18))
         row.addWidget(self.btn_rescan)
         row.addWidget(self.btn_other)
+        self.btn_check = QPushButton("  Verifica conflitti")
+        self.btn_check.setIcon(icon("check", T["TEXT"], 18))
+        self.btn_check.setToolTip("Anteprima del merge: dice se ci sarebbero conflitti, senza inviare nessuna richiesta")
+        self.btn_check.setVisible(check_fn is not None)
+        row.addWidget(self.btn_check)
         self.chk_all = QCheckBox("Mostra tutti i file")
         self.chk_all.setToolTip("Elenca qualsiasi file della cartella, non solo quelli con l'estensione del Master")
         row.addWidget(self.chk_all)
@@ -101,6 +113,7 @@ class MergeRequestDialog(QDialog):
 
         self.btn_rescan.clicked.connect(self.rescan)
         self.btn_other.clicked.connect(self.browse_other)
+        self.btn_check.clicked.connect(lambda _c=False: self.check_conflicts())
         self.chk_all.toggled.connect(lambda _on: self.rescan())
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.itemDoubleClicked.connect(lambda _i: self.ok_btn.isEnabled() and self.accept())
@@ -162,8 +175,19 @@ class MergeRequestDialog(QDialog):
                 st, col = "Da verificare", T["ORANGE"]
             self.table.setItem(r, 3, item(st, col))
 
+    def check_conflicts(self) -> None:
+        """«Verifica conflitti»: esegue il dry-run sul file selezionato e mostra l'esito sotto la tabella."""
+        c = self.selected()
+        if self._check_fn is None or c is None or not c.looks_ok:
+            return
+        self.info.setText(muted_html("Verifica in corso..."))
+        path, fn = c.path, self._check_fn
+        self._run(lambda: fn(path), lambda p: self.info.setText(preview_html(p)),
+                  lambda e: self.info.setText(f"<span style='color:{T['RED']}'>{getattr(e, 'detail', e)}</span>"))
+
     def _selection_changed(self) -> None:
         c = self.selected()
+        self.btn_check.setEnabled(c is not None and c.looks_ok)
         self.ok_btn.setEnabled(c is not None and c.looks_ok)
         if not self._cands:
             self.info.setText(f"<span style='color:{T['ORANGE']}'>Nessun file {self.ext.upper()} trovato in questa cartella."

@@ -285,7 +285,24 @@ class ApprovalDialog(QDialog):
         self.conf_list = QListWidget()
         self.conf_panel = ConflictPanel()
         csp = QSplitter()
-        csp.addWidget(self.conf_list)
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(6)
+        bulk = QLabel("Applica a tutti i conflitti da risolvere:")
+        bulk.setProperty("muted", True)
+        ll.addWidget(bulk)
+        self.bulk_btns = {}
+        for key, text, tip in (("mine", "Tutti: la proposta", "Per ogni conflitto tieni la versione della proposta"),
+                               ("theirs", "Tutti: il Master", "Per ogni conflitto tieni la versione del Master"),
+                               ("both", "Entrambe (dove possibile)", "Dove sono righe/rung tieni Master e poi proposta")):
+            b = QPushButton(text)
+            b.setToolTip(tip + ". Puoi poi cambiare i singoli conflitti prima di «Applica risoluzioni».")
+            b.clicked.connect(lambda _c=False, k=key: self.apply_all(k))
+            ll.addWidget(b)
+            self.bulk_btns[key] = b
+        ll.addWidget(self.conf_list, 1)
+        csp.addWidget(left)
         csp.addWidget(self.conf_panel)
         csp.setStretchFactor(1, 4)
         csp.setSizes([280, 940])
@@ -412,6 +429,8 @@ class ApprovalDialog(QDialog):
         self.btn_cancel.setEnabled(pm.cancel)
         self.btn_apply.setEnabled(pm.resolve and bool(self._pending))
         self.btn_apply.setVisible(bool(d.conflicts) and pm.resolve)
+        for b in self.bulk_btns.values():
+            b.setEnabled(pm.resolve and bool(d.conflicts))
         self.btn_force.setVisible(self.role >= Role.ADMIN)
         self.btn_force.setEnabled(pm.force)
         self.btn_force.setToolTip("" if pm.force else "Risolvi (e applica) tutti i conflitti prima di forzare il merge")
@@ -480,6 +499,27 @@ class ApprovalDialog(QDialog):
         c = d.conflicts[row]
         self.conf_panel.show_conflict(c, d.base_revision, d.author, d.head_revision, self._pending.get(c.id),
                                       self.perms.resolve)
+
+    def apply_all(self, choice: str, only_unresolved: bool = True) -> int:
+        """Imposta la stessa risoluzione (mine / theirs / both) su tutti i conflitti ancora da risolvere (``both`` solo dove
+        e' un blocco di rung/righe). Resta da premere «Applica risoluzioni». Ritorna quanti ne ha impostati."""
+        d = self.detail
+        if d is None or self.perms is None or not self.perms.resolve or choice not in ("mine", "theirs", "both"):
+            return 0
+        n = 0
+        for c in d.conflicts:
+            if (only_unresolved and c.resolved) or (choice == "both" and not c.sequence):
+                continue
+            self._pending[c.id] = ResolutionIn(choice=choice)
+            n += 1
+        self.perms = compute_permissions(d, self.me, self.role, len(self._pending))
+        self.btn_apply.setEnabled(self.perms.resolve)
+        self.btn_force.setEnabled(self.perms.force)
+        row = self.conf_list.currentRow()
+        self._fill_conflicts()
+        self.conf_list.setCurrentRow(max(row, 0))
+        self.status.setText(f"{n} conflitti impostati su «{CHOICE_IT[choice]}»: premi «Applica risoluzioni»" if n else "")
+        return n
 
     def _choice(self, cid: str, res: ResolutionIn) -> None:
         self._pending[cid] = res

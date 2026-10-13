@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from common.roles import Role
-from common.schemas import (AuthSessionOut, LoginIn, PasswordChange, RefreshIn, RoleOut, TokenPair,
+from common.schemas import (AccountPolicy, AuthSessionOut, LoginIn, PasswordChange, RefreshIn, RoleOut, TokenPair,
                             UserCreate, UserOut, UserUpdate)
 from server.auth.models import Principal
 from server.auth.rbac import get_principal, min_role
@@ -45,6 +45,14 @@ def build_router() -> APIRouter:
     @r.delete("/auth/sessions/{sid}", status_code=204)
     def revoke(sid: str, request: Request, p: Principal = Depends(get_principal)):
         svc(request).revoke_session(p, sid)
+
+    @r.get("/auth/policy", response_model=AccountPolicy)
+    def get_policy(request: Request, _: Principal = Depends(get_principal)):
+        return svc(request).policy()
+
+    @r.put("/auth/policy", response_model=AccountPolicy)
+    def set_policy(body: AccountPolicy, request: Request, p: Principal = Depends(min_role(Role.ADMIN))):
+        return svc(request).set_policy(p, body)
 
     @r.get("/roles", response_model=list[RoleOut])
     def roles(request: Request, _: Principal = Depends(min_role(Role.VIEWER))):

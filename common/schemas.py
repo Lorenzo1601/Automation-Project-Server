@@ -57,6 +57,9 @@ class UserOut(BaseModel):
     must_change_password: bool = False
     created_at: Optional[datetime] = None
     last_login_at: Optional[datetime] = None
+    locked_until: Optional[datetime] = None          # account bloccato (troppi tentativi falliti) fino a questo istante
+    password_changed_at: Optional[datetime] = None
+    password_expires_at: Optional[datetime] = None   # solo se l'Admin ha attivato la scadenza delle password
 
 
 class TokenPair(BaseModel):
@@ -84,6 +87,31 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     new_password: Optional[str] = None          # reset da parte dell'Admin
     must_change_password: Optional[bool] = None
+    unlock: Optional[bool] = None               # True = sblocca l'account bloccato per troppi tentativi falliti
+
+
+class PreviewConflict(BaseModel):
+    path: str
+    title: str = ""
+    label: str = ""
+    kind: str = ""
+
+
+class PreviewOut(BaseModel):
+    """Anteprima («dry-run») di un merge: cosa succederebbe, senza creare alcuna richiesta."""
+    head_revision: int
+    n_changes: int = 0
+    n_upstream: int = 0
+    n_conflicts: int = 0
+    conflicts: list[PreviewConflict] = []
+    touched: list[str] = []
+    warnings: list[str] = []
+    clean: bool = True                      # nessun conflitto: il merge potrebbe procedere senza interventi
+    nothing_to_merge: bool = False          # nessuna differenza rispetto alla testa
+
+
+class AccountPolicy(BaseModel):
+    password_max_age_days: int = Field(default=0, ge=0, le=3650)    # 0 = le password non scadono
 
 
 class PasswordChange(BaseModel):

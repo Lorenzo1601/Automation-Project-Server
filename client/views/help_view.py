@@ -25,7 +25,7 @@ from client.views.common import eyebrow, heading, subtitle
 
 APP_NAME = "Automation Project Server"
 CLIENT_NAME = "Automation Project Client"
-APP_VERSION = "2.0"
+from common.version import APP_VERSION   # noqa: E402
 
 
 # ======================================================================================= helper HTML
@@ -368,7 +368,7 @@ revisione di partenza. La scheda <b>Conflitti</b> della schermata di consenso mo
 ], [34, 66])}
 {steps([f"Seleziona un conflitto nell'elenco a sinistra (quelli da risolvere sono segnati «DA RISOLVERE»).",
         "Scegli come risolverlo.",
-        f"Quando hai scelto per tutti, premi {ui('Applica risoluzioni')}.",
+        f"Quando hai scelto per tutti, premi {ui('Applica risoluzioni')}. Con i pulsanti {ui('Tutti: la proposta')}, {ui('Tutti: il Master')} e {ui('Entrambe (dove possibile)')} imposti la stessa scelta su tutti i conflitti da risolvere in un colpo solo, poi puoi correggere i singoli.",
         "Il server ricalcola il merge: i consensi eventualmente già dati si azzerano e si riparte dal voto."])}
 {warn("Finché ci sono conflitti non risolti nessuno può dare il consenso. Scegli con attenzione: «Tieni il Master» e «Tieni la "
       "proposta» scartano del lavoro di qualcuno. Per i casi dubbi usa il commento per accordarti con il collega.")}
@@ -552,7 +552,8 @@ def _t_notifiche() -> str:
     [f'<span style="color:{T["RED"]}; font-weight:700;">&#9679; rosso</span>', "<b>Server offline</b>: controlla che il server sia acceso e raggiungibile."],
 ], [26, 74])}
 <h2>Che cosa ti viene notificato</h2>
-{bullets(["Una <b>nuova richiesta di merge</b> in cui devi votare: si apre da sola la schermata di consenso.",
+<p>Sotto il LED c'è la <b>campanella</b>: il numero in arancione indica le notifiche <b>non lette</b>. Le notifiche restano salvate sul server anche se eri offline: aprendo la campanella trovi le nuove richieste di merge da votare, quelle rifiutate o unite, i salvataggi nei branch e le volte in cui sei stato menzionato. Con un doppio clic apri la richiesta collegata. Se l'amministratore ha configurato la posta (SMTP) le ricevi anche per <b>email</b>.</p>
+{bullets(["Quando un collega salva una <b>nuova revisione del branch</b> in cui lavori, il client te lo segnala e ti propone di scaricarla (il tuo file con modifiche non viene sovrascritto); sotto la cartella locale compare «disponibile la rev N».","Una <b>nuova richiesta di merge</b> in cui devi votare: si apre da sola la schermata di consenso.",
           "Richieste rifiutate, merge completati e aggiornamenti del Master: messaggio nell'<b>area di notifica</b> di Windows (se disponibile), nella barra di stato in basso e nel pannello <b>Eventi</b> della schermata principale.",
           "Il <b>reimport automatico</b> dopo un tuo merge: finestra non bloccante, vedi " + link("reimport-auto", "Reimport automatico dopo il merge") + "."])}
 <p>Le finestre di consenso e di avviso sono <b>non bloccanti</b>: puoi continuare a lavorare nella finestra principale e tornare
@@ -636,6 +637,7 @@ finché non unisci un branch. Si sceglie dal menu <b>BRANCH</b> nella barra late
      "Scrivono tutti i Developer. " + ui("Salva su branch...") + " unisce le tue modifiche a quelle già nel branch (senza perdere il lavoro dei colleghi) e le salva subito, senza votazione: i colleghi le trovano con il Checkout del branch. Se c'è un conflitto sulla stessa riga la richiesta resta da risolvere. Resta possibile anche " + ui("Richiedi Merge...") + " per chiedere il consenso. Il consenso serve comunque per unire nel principale."],
 ], [18, 30, 52])}
 {bullets(["Un branch nasce dalla <b>testa del principale</b> (o da una revisione conservata a tua scelta): la sua rev 1 è una copia di quella revisione.",
+          ui("Anteprima conflitti") + " (nell'elenco dei branch) e " + ui("Verifica conflitti") + " (nelle finestre dei file da unire): simulano l'unione o l'aggiornamento e dicono quanti elementi cambiano e quali andrebbero in conflitto, <b>senza creare nessuna richiesta</b>.",
           ui("Aggiorna dal principale") + ": porta nel branch le novità del principale con un merge a tre vie; se ci sono conflitti li risolvi come al solito.",
           ui("Unisci nel principale...") + ": si apre la stessa finestra di Richiedi Merge per scegliere il file da inviare (di norma il file di lavoro del branch); se è diverso dalla testa, nel tuo branch personale viene prima salvato; in un branch di team il file viene inviato direttamente nella richiesta di merge nel principale. Poi parte la richiesta di merge nel principale, con il consenso normale. A merge avvenuto il branch diventa «unito» e resta in sola lettura.",
           "<b>Chiudi</b> rende il branch di sola lettura; <b>Elimina</b> lo rimuove con tutti i suoi file (proprietario, Admin, e i Lead per i branch di team).",
@@ -644,6 +646,20 @@ finché non unisci un branch. Si sceglie dal menu <b>BRANCH</b> nella barra late
 {warn("Se il branch cambia dopo che hai chiesto l'unione, la richiesta viene annullata: rifalla. I file binari si salvano e si versionano nei branch personali ma non si possono unire con il merge.")}
 <p>Le revisioni del principale da cui partono i branch aperti non vengono eliminate dal limite di revisioni
 (vedi {link("retention", "Revisioni conservate e pulizia")}). Le operazioni sono nella {link("audit", "cronologia eventi")}.</p>
+"""
+
+
+def _t_account() -> str:
+    return f"""
+<h1>Sicurezza dell'account e aggiornamento del client</h1>
+{who("Viewer", note="— criteri e pubblicazione del client: solo Admin")}
+<h2>Blocco dell'account</h2>
+<p>Dopo troppi tentativi di accesso falliti l'account viene <b>bloccato per qualche minuto</b>. Il blocco è salvato sul server: resiste anche a un suo riavvio. Un Admin può sbloccarlo subito da {link("ruoli", "Utenti &amp; Permessi")} con il pulsante {ui("Sblocca")} (lo stato dell'utente mostra «Bloccato»).</p>
+<h2>Scadenza delle password (facoltativa)</h2>
+<p>Di default le password <b>non scadono</b>. Un Admin può impostare un numero di giorni in {ui("Utenti &amp; Permessi")} (campo «Scadenza password»): alla scadenza, al primo accesso, l'utente deve scegliere una nuova password. Con «mai» la scadenza è disattivata.</p>
+<h2>Aggiornamento automatico del client</h2>
+<p>L'Admin pubblica l'ultimo {mono("AutomationProjectClient.exe")} dalle <b>Impostazioni del server</b> («Aggiornamento del client»). Quando un utente accede e la versione sul server è più recente della sua, il client lo avvisa: se accetta scarica il file, ne <b>verifica l'impronta SHA-256</b>, si chiude e riparte già aggiornato. Funziona dall'eseguibile; eseguito dai sorgenti il client segnala soltanto la nuova versione.</p>
+{tip("Dopo aver compilato un nuovo client, aumenta il numero di versione (common/version.py) prima di pubblicarlo, altrimenti i client non lo riconoscono come più recente.")}
 """
 
 
@@ -760,6 +776,7 @@ def build_topics() -> list[HelpTopic]:
         HelpTopic("https", "Connessione cifrata (HTTPS)", g3, _t_https(), "tls certificato autofirmato impronta wss"),
         HelpTopic("audit", "Cronologia eventi e audit", g3, _t_audit(), "hash catena integrita csv registro"),
         HelpTopic("notifiche", "Notifiche e stato", g3, _t_notifiche(), "led tray connessione avvisi"),
+        HelpTopic("account", "Sicurezza account e aggiornamento del client", g3, _t_account(), "blocco account password scadenza sblocca aggiornamento versione exe"),
         HelpTopic("server", "Server (solo per Admin)", g3, _t_server(), "servizio windows backup udp 8751 firewall cartella dati"),
         HelpTopic("problemi", "Risoluzione dei problemi", g4, _t_problemi(), "errore 401 sessione scaduta antivirus non trovo"),
         HelpTopic("scorciatoie", "Scorciatoie da tastiera e Informazioni", g4, _t_scorciatoie(), "f1 tasti versione info"),

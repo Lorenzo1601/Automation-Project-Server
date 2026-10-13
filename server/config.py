@@ -30,6 +30,13 @@ class Settings:
     lock_ttl_h: float = field(default_factory=lambda: float(_env("APS_LOCK_TTL_H", "8")))    # durata della presa in carico (lock) del Master, in ore
     host: str = field(default_factory=lambda: _env("APS_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(_env("APS_PORT", "8750")))
+    # Email opzionale per le notifiche (senza smtp_host le notifiche restano solo nell'app)
+    smtp_host: str = field(default_factory=lambda: _env("APS_SMTP_HOST", ""))
+    smtp_port: int = field(default_factory=lambda: int(_env("APS_SMTP_PORT", "587")))
+    smtp_user: str = field(default_factory=lambda: _env("APS_SMTP_USER", ""))
+    smtp_password: str = field(default_factory=lambda: _env("APS_SMTP_PASSWORD", ""))
+    smtp_from: str = field(default_factory=lambda: _env("APS_SMTP_FROM", ""))
+    smtp_security: str = field(default_factory=lambda: _env("APS_SMTP_SECURITY", "starttls").strip().lower())   # starttls | ssl | none
     # TLS (HTTPS + WSS). Senza certfile si usa/crea il certificato autofirmato in <data>/tls (vedi server/tls.py)
     tls_enabled: bool = field(default_factory=lambda: _env("APS_TLS_ENABLED", "").strip().lower() in ("1", "true", "yes", "on"))
     tls_certfile: str = field(default_factory=lambda: _env("APS_TLS_CERTFILE", ""))

@@ -34,6 +34,7 @@ class Notifier:
         self._conns: dict[str, set[WebSocket]] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.inbox = None                                      # InboxService: trasforma gli eventi in notifiche persistenti
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -63,10 +64,24 @@ class Notifier:
         ``only`` restringe un broadcast di progetto: ``"main"`` = solo client del principale, ``"branches"`` = solo client
         di un branch qualsiasi (``None`` = tutti i client del progetto).
         """
+        tset = None if targets is None else set(targets)
+        if self.inbox is not None:
+            try:
+                self.inbox.on_event(event, tset, scope)
+            except Exception:                                  # noqa: BLE001  (la posta non deve mai bloccare il lavoro)
+                log.exception("Errore nella posta in arrivo")
         if self._loop is None or self._loop.is_closed():
             return
-        asyncio.run_coroutine_threadsafe(
-            self._send(event, None if targets is None else set(targets), scope, only), self._loop)
+        asyncio.run_coroutine_threadsafe(self._send(event, tset, scope, only), self._loop)
+
+    def publish_user(self, user_id: int, event: dict) -> None:
+        """Invia ``event`` a tutte le connessioni dell'utente (principale e branch di qualsiasi progetto)."""
+        if self._loop is None or self._loop.is_closed():
+            return
+        with self._lock:
+            keys = {sid for sid in self._conns if sid.rsplit(":", 1)[-1] == f"u{user_id}"}
+        if keys:
+            asyncio.run_coroutine_threadsafe(self._send(event, keys), self._loop)
 
     def close_project(self, project_id: int, event: dict, timeout: float = 3.0) -> None:
         """Invia ``event`` a tutti i client di un progetto e ne chiude le connessioni (es. progetto eliminato).

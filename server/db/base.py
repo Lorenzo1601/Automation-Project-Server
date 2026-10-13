@@ -41,6 +41,13 @@ class Database:
         if "projects" in insp.get_table_names() and "max_revisions" not in {c["name"] for c in insp.get_columns("projects")}:
             with self.engine.begin() as cx:
                 cx.execute(text("ALTER TABLE projects ADD COLUMN max_revisions INTEGER NOT NULL DEFAULT 10"))
+        if "users" in insp.get_table_names():
+            ucols = {c["name"] for c in insp.get_columns("users")}
+            for col, ddl in (("failed_attempts", "INTEGER NOT NULL DEFAULT 0"), ("locked_until", "DATETIME"),
+                             ("password_changed_at", "DATETIME")):
+                if col not in ucols:
+                    with self.engine.begin() as cx:
+                        cx.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
         # branch: la tabella nuova la crea create_all; qui si aggiungono solo colonne introdotte dopo (database gia' esistenti)
         if "branches" in insp.get_table_names():
             cols = {c["name"] for c in insp.get_columns("branches")}

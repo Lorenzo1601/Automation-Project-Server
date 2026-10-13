@@ -36,6 +36,9 @@ ACTIONS = {
     "comment_added": "Commento aggiunto", "comment_edited": "Commento modificato", "comment_deleted": "Commento eliminato",
     "branch_created": "Branch creato", "branch_synced": "Branch aggiornato dal principale", "branch_merged": "Branch unito",
     "branch_closed": "Branch chiuso", "branch_deleted": "Branch eliminato", "branch_committed": "Salvataggio su branch",
+    "account_locked": "Account bloccato", "password_expired": "Password scaduta",
+    "account_policy_changed": "Criteri account modificati", "client_update_published": "Client pubblicato per l'aggiornamento",
+    "client_update_removed": "Aggiornamento client rimosso",
     "console_session": "Console server", "permission_granted": "Permesso assegnato", "permission_revoked": "Permesso revocato",
 }
 ACTION_COLORS = {
@@ -45,7 +48,8 @@ ACTION_COLORS = {
     "master_reimported": T["ORANGE"], "revisions_pruned": T["ORANGE"], "retention_changed": T["ORANGE"],
     "project_deleted": T["RED"], "user_deleted": T["RED"], "project_exported": T["ACCENT"], "backup_created": T["ACCENT"],
     "lock_forced": T["ORANGE"], "tls_settings_changed": T["ORANGE"], "branch_merged": T["GREEN"], "branch_deleted": T["ORANGE"],
-    "revision_locked": T["ACCENT"], "branch_created": T["ACCENT"],
+    "revision_locked": T["ACCENT"], "branch_created": T["ACCENT"], "account_locked": T["RED"],
+    "password_expired": T["ORANGE"], "account_policy_changed": T["ORANGE"], "client_update_published": T["ACCENT"],
 }
 HEADERS = ["Data", "Utente", "Azione", "Progetto", "Oggetto", "Dettagli", "Hash"]
 

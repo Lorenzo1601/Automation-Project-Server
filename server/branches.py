@@ -38,7 +38,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select
 
 from common.roles import Role
-from common.schemas import ACTIVE_STATES, Event, MasterInfo, ProposalDetail
+from common.schemas import ACTIVE_STATES, Event, MasterInfo, PreviewOut, ProposalDetail
 from common.schemas_branches import MAX_PERSONAL_BRANCHES, BranchCreate, BranchOut
 from server.config import Settings
 from server.db.audit import AuditService
@@ -463,6 +463,39 @@ def build_router(ctx: Callable[..., Callable], registry, audit: AuditService, cf
             except SessionError as exc:
                 raise HTTPException(exc.status, exc.message) from exc
             return main.mgr.detail(p)
+        return await run_in_threadpool(work)
+
+    # ------------------------------------------------------------------ anteprima (dry-run)
+    @r.post("/{slug}/dry-run", response_model=PreviewOut)
+    async def dry_run(slug: str, mode: str = Form("merge"), file: Optional[UploadFile] = File(None),
+                      c=Depends(ctx(Role.DEVELOPER, use_branch=False))):
+        """Anteprima senza effetti: ``mode=merge`` = «Unisci nel principale» (opz. ``file``), ``mode=sync`` = «Aggiorna dal
+        principale». Dice quanti elementi cambiano e quali andrebbero in conflitto."""
+        info = load(c, slug)
+        if mode not in ("merge", "sync"):
+            raise HTTPException(422, "mode deve essere «merge» o «sync»")
+        main, brt = registry.runtime(info.project_id), registry.runtime(info.project_id, slug)
+        sent = await file.read() if file is not None and file.filename else None
+
+        def work():
+            try:
+                if mode == "merge":
+                    with brt.mgr._lock:                                           # noqa: SLF001
+                        data = sent if sent is not None else brt.store.read_revision(brt.store.head().revision)
+                    return main.mgr.dry_run(data, info.base_main_revision)
+                with main.mgr._lock:                                              # noqa: SLF001
+                    if not main.store.initialized:
+                        raise HTTPException(409, "Master non inizializzato")
+                    head = main.store.head().revision
+                    if head <= info.base_main_revision:
+                        raise HTTPException(409, f"Il branch «{info.name}» e' gia' aggiornato rispetto al principale")
+                    if main.store.is_purged(info.base_main_revision) or not main.store.has_revision(info.base_main_revision):
+                        raise HTTPException(409, "La revisione base del branch non e' piu' conservata nel principale")
+                    base = main.store.read_revision(info.base_main_revision)
+                    theirs = main.store.read_revision(head)
+                return brt.mgr.dry_run(theirs, info.base_main_revision, base_data=base, swap=True)
+            except SessionError as exc:
+                raise HTTPException(exc.status, exc.message) from exc
         return await run_in_threadpool(work)
 
     # ------------------------------------------------------------------ chiusura / eliminazione

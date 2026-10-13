@@ -49,7 +49,7 @@ client/gui_approval.py     schermata Consenso + Diff + Conflitti      client/gui
 run_server.py / run_client.py   entry point per PyInstaller (run_server.py = exe unico del server: GUI, servizio, CLI)
 server/launcher.py         smista gli argomenti dell'exe unico: GUI | install/start/stop/... | serve | --run-service    build_server.bat / build_client.bat   creano gli exe
 client/api_client.py       client HTTP con refresh automatico del token   client/ws_listener.py  push
-tests/                     409 test (merger, tipi di file, nomi file, reimport, consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
+tests/                     ~450 test (merger, tipi di file, nomi file, reimport, consenso, REST+WS, RBAC, audit, GUI offscreen su server reale)
 samples/                   L5X di esempio: base, DevA, DevB (con e senza conflitti)
 ```
 
@@ -272,7 +272,9 @@ Autenticazione: `Authorization: Bearer <access_token>`. WebSocket: `/ws?token=<a
 | `POST /api/auth/login` · `/refresh` · `/logout` · `/change-password`, `GET /api/auth/me` | pubblico / utente |
 | `GET /api/auth/sessions[?all=true]`, `DELETE /api/auth/sessions/{id}` | utente (le proprie) / Admin (tutte) |
 | `GET /api/roles` | Viewer |
-| `GET/POST /api/users`, `PATCH /api/users/{id}` | Admin |
+| `GET/POST /api/users`, `PATCH /api/users/{id}` (anche `unlock`), `DELETE /api/users/{id}`, `PUT /api/auth/policy` | Admin |
+| `GET /api/notifications` · `/count`, `POST /api/notifications/read` | utente (le proprie) |
+| `GET /api/client/update`, `/download`; `POST/DELETE /api/client/update` | utente / Admin |
 | `GET /api/projects` | Viewer (solo quelli accessibili) |
 | `POST /api/projects`, `PATCH /api/projects/{id}` (anche `max_revisions`), `GET/PUT /api/projects/{id}/permissions` | Admin |
 | `DELETE /api/projects/{id}?confirm=<nome esatto>` (elimina progetto, file e audit del progetto) | Admin |
@@ -353,6 +355,14 @@ nuova ricordati di documentarla in `client/views/help_view.py` e, se genera un e
 
 * **Eliminazione utenti** (solo Admin, `DELETE /api/users/{id}`, pulsante «Elimina utente...» in Utenti & Permessi del client e della console del server): sessioni e permessi di progetto vengono rimossi; audit, commenti e branch restano col nome; non si elimina se stessi né l'ultimo Admin attivo. Audit: `user_deleted`.
 
+* **Richieste di merge persistenti**: le richieste aperte (principale e branch) sono salvate in `pending.json` di ogni progetto/branch; al riavvio il server le ricarica, le rianalizza sulla testa corrente e mantiene i consensi solo se il risultato del merge è identico.
+* **Blocco account persistente e scadenza password opzionale**: dopo N errori (`APS_MAX_LOGIN_FAILURES`) l'account è bloccato nel database (resiste al riavvio; l'Admin lo sblocca con `PATCH /api/users/{id} {"unlock": true}` o dal pulsante «Sblocca»). L'Admin può impostare la scadenza delle password (`GET/PUT /api/auth/policy`, `password_max_age_days`, 0 = mai): alla scadenza il primo accesso impone il cambio. Audit: `account_locked`, `password_expired`, `account_policy_changed`.
+* **Anteprima conflitti (dry-run)**: `POST /api/projects/{id}/proposals/dry-run` e `POST .../branches/{slug}/dry-run` (`mode=merge|sync`, `file` facoltativo) eseguono lo stesso 3-way senza creare richieste e restituiscono conflitti e modifiche. Nel client: «Verifica conflitti» nelle finestre dei file da unire e «Anteprima conflitti» nell'elenco branch.
+* **Notifiche persistenti** (`GET /api/notifications`, `/count`, `POST /read`): nuova richiesta di merge da votare, richiesta rifiutata / unita, branch aggiornato, menzioni. Restano anche se l'utente è offline; il client le mostra con la campanella (numero non lette) e l'evento WebSocket `notification`. **Email opzionale** se sono impostati `APS_SMTP_HOST`, `APS_SMTP_PORT`, `APS_SMTP_USER`, `APS_SMTP_PASSWORD`, `APS_SMTP_FROM`, `APS_SMTP_SECURITY` (`starttls` | `ssl` | `none`) e l'utente ha un indirizzo email.
+* **Avviso di nuova revisione**: se un collega salva nel branch su cui lavori, il client propone di scaricarla e mostra «disponibile la rev N» sotto la cartella locale.
+* **Risoluzione dei conflitti**: oltre alla scelta per elemento (proposta / Master / entrambe / manuale), pulsanti «Tutti: la proposta», «Tutti: il Master», «Entrambe (dove possibile)».
+* **Aggiornamento automatico del client**: l'Admin pubblica `AutomationProjectClient.exe` dalle Impostazioni del server (o `POST /api/client/update`, multipart `file`, `version`, `notes`); all'accesso il client confronta la propria versione (`common/version.py`) con quella pubblicata (`GET /api/client/update?current=`), scarica, verifica lo SHA-256 e si sostituisce con uno script `.bat` riavviandosi. Dai sorgenti segnala soltanto. Audit: `client_update_published/removed`. **Non provato su Windows** (solo la logica e lo script generato).
+
 ## Sicurezza e audit
 
 * Password con **bcrypt** (con pre-hash SHA-256), policy ≥ 10 caratteri con lettera e cifra, blocco temporaneo dopo 5 errori.
@@ -371,7 +381,7 @@ nuova ricordati di documentarla in `client/views/help_view.py` e, se genera un e
 * **LDAP / Active Directory non implementato**: solo account locali con bcrypt.
 * **TLS** autofirmato: il client si fida al primo collegamento (impronta memorizzata); per una PKI aziendale usa un certificato proprio. Non provato su Windows (Schannel/servizio).
 * **PLCopen/CODESYS** provato su esempi sintetici e sul formato standard, non su export reali CODESYS (metodi, struttura del progetto).
-* Le **prese in carico** restano finché non scadono (8 h) o vengono rilasciate; le richieste di merge dei branch, come quelle del principale, non sono persistite al riavvio.
+* Le **prese in carico** restano finché non scadono (8 h) o vengono rilasciate; le richieste di merge in sospeso sono persistite al riavvio (vedi sopra), ma le sessioni dei client senza account non lo sono.
 * Race rarissima sulla creazione simultanea dello stesso nome di branch (500 invece di 409).
 * L'app grafica del server e' pensata per **una sola istanza per cartella dati**: non avviarne due sulla stessa cartella.
   Chiudendo la finestra il server si ferma (nessuna icona nell'area di notifica): per un servizio sempre attivo usa la
@@ -382,9 +392,7 @@ nuova ricordati di documentarla in `client/views/help_view.py` e, se genera un e
   `<cartella dati>\\logs\\server.log` e il Visualizzatore eventi.
 * Le revisioni piu' vecchie del limite sono **eliminate in modo definitivo** dal server: per tenerle, esporta il progetto o
   alza il limite prima che vengano potate. Il backup (`--backup`) copia solo il database SQLite della cartella dati.
-* Le **richieste di merge in sospeso non sono persistite**: al riavvio del server vanno reinviate. Master, revisioni, utenti
-  e audit invece sono su disco.
-* Il blocco dopo password errate è **in memoria** (si azzera al riavvio) e per singolo processo.
+* Le **notifiche** agli utenti collegati arrivano in tempo reale solo se il WebSocket è attivo; le email partono in un thread senza coda di ritentativi (un errore SMTP è solo registrato nel log).
 * La **Safety Signature** dei controller GuardLogix non viene ricalcolata dal merge: va verificata in Studio 5000.
 * Il merge è stato provato solo su **L5X sintetici** (`tests/sample_l5x.py`): prima dell'uso in produzione provalo su copie di
   progetti reali. Gli elementi che il merge non scompone (diversi da Rung/Line, Tag, UDT, AOI, Program, Routine) sono

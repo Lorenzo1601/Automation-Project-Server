@@ -109,6 +109,7 @@ class BranchesDialog(QDialog):
     switch_requested = Signal(str)       # slug del branch a cui passare ("" = principale)
     sync_requested = Signal(str)         # «Aggiorna dal principale» su questo branch
     merge_requested = Signal(str)        # «Unisci nel principale» per questo branch
+    preview_requested = Signal(str, str)  # (slug, 'merge'|'sync'): anteprima dei conflitti, senza effetti
     changed = Signal()                   # creato / chiuso / eliminato: la finestra principale ricarica l'elenco
 
     def __init__(self, api: ApiClient, project: ProjectOut, role: Role, current: Optional[str] = None,
@@ -145,6 +146,9 @@ class BranchesDialog(QDialog):
         self.btn_main = QPushButton("Passa al principale")
         self.btn_sync = QPushButton("Aggiorna dal principale")
         self.btn_merge = QPushButton("Unisci nel principale...")
+        self.btn_preview = QPushButton("Anteprima conflitti")
+        self.btn_preview.setToolTip("Simula l'unione nel principale (o l'aggiornamento dal principale) e mostra i conflitti, "
+                                    "senza creare richieste")
         self.btn_close_branch = QPushButton("Chiudi")
         self.btn_delete = QPushButton("Elimina...")
         self.btn_delete.setProperty("variant", "danger")
@@ -152,8 +156,8 @@ class BranchesDialog(QDialog):
         self.btn_reload.setIcon(icon("refresh", T["TEXT"], 18))
         self.btn_reload.setToolTip("Ricarica l'elenco")
         self.btn_reload.setProperty("variant", "ghost")
-        for b in (self.btn_new, self.btn_switch, self.btn_main, self.btn_sync, self.btn_merge, self.btn_close_branch,
-                  self.btn_delete, self.btn_reload):
+        for b in (self.btn_new, self.btn_switch, self.btn_main, self.btn_sync, self.btn_merge, self.btn_preview,
+                  self.btn_close_branch, self.btn_delete, self.btn_reload):
             row.addWidget(b)
         row.addStretch(1)
         self.btn_done = QPushButton("Chiudi finestra")
@@ -161,7 +165,7 @@ class BranchesDialog(QDialog):
         lay.addLayout(row)
 
         if manage_only:
-            for w in (self.btn_switch, self.btn_main, self.btn_sync, self.btn_merge):
+            for w in (self.btn_switch, self.btn_main, self.btn_sync, self.btn_merge, self.btn_preview):
                 w.setVisible(False)
         self.table.itemSelectionChanged.connect(self._update_buttons)
         self.table.cellDoubleClicked.connect(lambda *_: self.btn_switch.isEnabled() and self.switch_to_selected())
@@ -170,6 +174,7 @@ class BranchesDialog(QDialog):
         self.btn_main.clicked.connect(lambda: (self.accept(), self.switch_requested.emit("")))
         self.btn_sync.clicked.connect(lambda: self.sync_selected())
         self.btn_merge.clicked.connect(lambda: self.merge_selected())
+        self.btn_preview.clicked.connect(lambda _c=False: self.preview_selected())
         self.btn_close_branch.clicked.connect(lambda: self.close_selected())
         self.btn_delete.clicked.connect(lambda: self.delete_selected())
         self.btn_reload.clicked.connect(lambda: self.reload())
@@ -229,7 +234,7 @@ class BranchesDialog(QDialog):
         self.btn_new.setToolTip("" if ok_new else why_p)
         self.btn_main.setEnabled(bool(self.current))
         if b is None:
-            for w in (self.btn_switch, self.btn_sync, self.btn_merge, self.btn_close_branch, self.btn_delete):
+            for w in (self.btn_switch, self.btn_sync, self.btn_merge, self.btn_preview, self.btn_close_branch, self.btn_delete):
                 w.setEnabled(False)
             self.lbl_sel.setText("Seleziona un branch.")
             return
@@ -237,6 +242,7 @@ class BranchesDialog(QDialog):
         self.btn_switch.setEnabled(ab.switch)
         self.btn_sync.setEnabled(ab.sync)
         self.btn_merge.setEnabled(ab.merge)
+        self.btn_preview.setEnabled(ab.merge or ab.sync)
         self.btn_close_branch.setEnabled(ab.close)
         self.btn_delete.setEnabled(ab.delete)
         self.btn_sync.setToolTip("Porta nel branch le novità del principale" if ab.sync else
@@ -273,6 +279,29 @@ class BranchesDialog(QDialog):
             return
         self.accept()
         self.merge_requested.emit(b.slug)
+
+    def preview_selected(self, mode: Optional[str] = None) -> None:
+        """«Anteprima conflitti»: ``mode`` None = chiede se simulare l'unione nel principale o l'aggiornamento dal principale."""
+        b = self.selected()
+        if b is None:
+            return
+        ab = abilities(b, self.role, self.current)
+        if mode is None:
+            mode = "merge" if ab.merge and not ab.sync else "sync" if ab.sync and not ab.merge else self.ask_mode()
+        if mode not in ("merge", "sync") or not (ab.merge if mode == "merge" else ab.sync):
+            return
+        self.accept()
+        self.preview_requested.emit(b.slug, mode)
+
+    def ask_mode(self) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setWindowTitle("Anteprima conflitti")
+        box.setText("Quale operazione vuoi simulare?")
+        bm = box.addButton("Unione nel principale", QMessageBox.AcceptRole)
+        bs = box.addButton("Aggiornamento dal principale", QMessageBox.AcceptRole)
+        box.addButton("Annulla", QMessageBox.RejectRole)
+        box.exec()
+        return "merge" if box.clickedButton() is bm else "sync" if box.clickedButton() is bs else None
 
     def close_selected(self) -> None:
         b = self.selected()

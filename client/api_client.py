@@ -16,8 +16,9 @@ import httpx
 from client import trust as _trust
 from common.roles import Role
 from common.schemas_branches import BranchCreate, BranchOut
+from common.schemas_inbox import NotificationOut, UpdateInfo
 from common.schemas_revisions import CompareOut, LockIn, LockOut, RevisionPatchIn
-from common.schemas import (AuditOut, AuditVerifyOut, AuthSessionOut, DecisionIn, DeveloperOut, MasterInfo,
+from common.schemas import (AccountPolicy, PreviewOut, AuditOut, AuditVerifyOut, AuthSessionOut, DecisionIn, DeveloperOut, MasterInfo,
                             PermissionIn, PermissionOut, ProjectCreate, ProjectDeleteOut, ProjectOut, ProjectUpdate,
                             ProposalDetail, ProposalSummary, ResolutionIn, ResolutionsIn, RestoreIn, RoleOut,
                             TokenPair, UserCreate, UserOut, UserUpdate)
@@ -224,6 +225,40 @@ class ApiClient:
     def create_user(self, data: UserCreate) -> UserOut:
         return UserOut(**self._req("POST", "/api/users", json=data.model_dump()).json())
 
+    # ----------------------------------------------------------------- aggiornamento del client
+    def client_update(self, current: str = "") -> UpdateInfo:
+        return UpdateInfo(**self._req("GET", "/api/client/update", params={"current": current}).json())
+
+    def download_client(self, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self._req("GET", "/api/client/download").content)
+
+    def publish_client(self, file: Path, version: str, notes: str = "") -> UpdateInfo:
+        with open(file, "rb") as f:
+            r = self._req("POST", "/api/client/update", data={"version": version, "notes": notes},
+                          files={"file": (Path(file).name, f, "application/octet-stream")})
+        return UpdateInfo(**r.json())
+
+    def notifications(self, unread_only: bool = False, limit: int = 100) -> list[NotificationOut]:
+        return [NotificationOut(**n) for n in self._req("GET", "/api/notifications",
+                                                         params={"unread_only": unread_only, "limit": limit}).json()]
+
+    def notifications_unread(self) -> int:
+        return int(self._req("GET", "/api/notifications/count").json().get("unread", 0))
+
+    def mark_notifications_read(self, ids: Optional[list[int]] = None) -> int:
+        return int(self._req("POST", "/api/notifications/read", json={"ids": ids}).json().get("unread", 0))
+
+    def account_policy(self) -> AccountPolicy:
+        return AccountPolicy(**self._req("GET", "/api/auth/policy").json())
+
+    def set_account_policy(self, password_max_age_days: int) -> AccountPolicy:
+        return AccountPolicy(**self._req("PUT", "/api/auth/policy",
+                                         json={"password_max_age_days": password_max_age_days}).json())
+
+    def unlock_user(self, uid: int) -> UserOut:
+        return self.update_user(uid, UserUpdate(unlock=True))
+
     def delete_user(self, uid: int) -> None:
         self._req("DELETE", f"/api/users/{uid}")
 
@@ -326,6 +361,13 @@ class ApiClient:
             r = self._req("POST", self._p("/proposals"), data={"base_revision": base_revision, "message": message},
                           files={"file": (file.name, f, "application/xml")})
         return ProposalDetail(**r.json())
+
+    def dry_run(self, file: Path, base_revision: int) -> PreviewOut:
+        """Anteprima di una richiesta di merge: quante modifiche e quali conflitti, senza inviare nulla."""
+        with open(file, "rb") as f:
+            r = self._req("POST", self._p("/proposals/dry-run"), data={"base_revision": base_revision},
+                          files={"file": (Path(file).name, f, "application/xml")})
+        return PreviewOut(**r.json())
 
     def proposals(self, active_only: bool = False) -> list[ProposalSummary]:
         return [ProposalSummary(**p) for p in self._req("GET", self._p("/proposals"),
@@ -457,6 +499,15 @@ class ApiClient:
         with open(file, "rb") as f:
             return ProposalDetail(**self._req("POST", url, data={"message": message},
                                               files={"file": (Path(file).name, f, "application/xml")}).json())
+
+    def branch_dry_run(self, slug: str, mode: str = "merge", file: Optional[Path] = None) -> PreviewOut:
+        """Anteprima senza effetti: ``mode`` = merge («Unisci nel principale») o sync («Aggiorna dal principale»)."""
+        url = f"/api/projects/{self.project_id}/branches/{slug}/dry-run"
+        if file is None:
+            return PreviewOut(**self._req("POST", url, data={"mode": mode}).json())
+        with open(file, "rb") as f:
+            return PreviewOut(**self._req("POST", url, data={"mode": mode},
+                                          files={"file": (Path(file).name, f, "application/xml")}).json())
 
     def close_branch(self, slug: str, pid: Optional[int] = None) -> BranchOut:
         return BranchOut(**self._req("POST", f"/api/projects/{self._bp(pid)}/branches/{slug}/close").json())

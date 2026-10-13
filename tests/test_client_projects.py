@@ -365,3 +365,40 @@ def test_delete_user_server_and_ui(fresh, qapp, monkeypatch):
     assert e.value.status in (401, 403)
     assert u.id not in [p.user_id for p in api.permissions(proj.id)]                       # i suoi permessi non ci sono piu'
     assert any(a.action == "user_deleted" and a.target == "da.eliminare" for a in api.audit(limit=50))
+
+
+def test_unlock_user_and_password_policy_ui(fresh, qapp, monkeypatch):
+    """Account bloccato per troppi tentativi: l'Admin lo sblocca dal pulsante; scadenza password impostabile dall'Admin."""
+    from client.api_client import ApiClient, ApiError
+    from client.views import user_mgmt_view as U
+    from common.schemas import UserCreate
+    api = ApiClient(fresh["url"])
+    api.login("admin", ADMIN_PW)
+    api.create_user(UserCreate(username="bloccato", display_name="Bloccato", password="Password-lunga-1", role="Developer",
+                               must_change_password=False))
+    for _ in range(12):                                                                    # supera qualunque soglia
+        try:
+            ApiClient(fresh["url"]).login("bloccato", "sbagliata-123")
+        except ApiError:
+            pass
+    msgs = Msgs(monkeypatch)
+    view = U.UserMgmtView(api, run=sync)
+    view.reload()
+    row = next(i for i, x in enumerate(view._users) if x.username == "bloccato")
+    view.users_table.selectRow(row)
+    u = view._users[row]
+    if not u.locked_until:                                                                 # soglia del server di test molto alta
+        pytest.skip("il server di test non blocca gli account")
+    assert view.btn_unlock.isEnabled() and "Bloccato" in view.users_table.item(row, 4).text()
+    view.btn_unlock.click()
+    view.reload()
+    assert not next(x for x in view._users if x.username == "bloccato").locked_until
+    ApiClient(fresh["url"]).login("bloccato", "Password-lunga-1")                          # ora entra
+    # scadenza password: 0 = mai; l'Admin la imposta dalla vista
+    view.spin_pw_age.setValue(45)
+    view.btn_pw_age.click()
+    assert api.account_policy().password_max_age_days == 45
+    view.reload()
+    assert view.spin_pw_age.value() == 45
+    view.apply_password_age(0)
+    assert api.account_policy().password_max_age_days == 0 and not msgs.warnings

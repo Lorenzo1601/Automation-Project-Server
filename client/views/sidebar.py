@@ -112,6 +112,7 @@ class Sidebar(QFrame):
     new_project_requested = Signal()     # pulsante «+» accanto al progetto (visibile solo all'Admin)
     logout_requested = Signal()
     password_requested = Signal()
+    notifications_requested = Signal()   # campanella: apre la posta in arrivo
 
     def __init__(self, parent: Optional[QWidget] = None, nav=CLIENT_NAV, subtitle: str = "Project Server",
                  show_projects: bool = True, admin_only: tuple = ("users",), logout_tip: str = "Esci",
@@ -232,6 +233,15 @@ class Sidebar(QFrame):
         col.addWidget(self.lbl_detail)
         st.addWidget(self.led)
         st.addLayout(col, 1)
+        self.btn_bell = QToolButton()
+        self.btn_bell.setObjectName("IconBtn")
+        self.btn_bell.setIcon(icon("bell", T["MUTED"], 18))
+        self.btn_bell.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_bell.setToolTip("Notifiche")
+        self.btn_bell.setCursor(Qt.PointingHandCursor)
+        self.btn_bell.clicked.connect(lambda _c=False: self.notifications_requested.emit())
+        self.btn_bell.setVisible(show_projects)        # la console del server non ha posta in arrivo
+        st.addWidget(self.btn_bell)
         cw = QHBoxLayout()
         cw.setContentsMargins(12, 0, 12, 0)
         cw.addWidget(self.conn)
@@ -292,6 +302,16 @@ class Sidebar(QFrame):
         for k in self.admin_only:
             if k in self.buttons:
                 self.buttons[k].setVisible(u.role == "Admin")
+
+    def set_unread(self, n: int) -> None:
+        """Numero di notifiche non lette accanto alla campanella (arancione se > 0)."""
+        self.unread = n
+        self.btn_bell.setIcon(icon("bell", T["ORANGE"] if n else T["MUTED"], 18))
+        self.btn_bell.setText(str(n) if n else "")
+        self.btn_bell.setStyleSheet(f"color:{T['ORANGE']}; font-weight:700;" if n else "")
+        self.btn_bell.setToolTip(f"{n} notifiche non lette" if n else "Notifiche")
+
+    unread = 0
 
     def set_can_create_project(self, on: bool) -> None:
         self.btn_new_project.setVisible(on)

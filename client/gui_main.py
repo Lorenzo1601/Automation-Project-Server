@@ -30,7 +30,11 @@ from client.views.dashboard_view import DashboardView
 from client.views.help_view import HelpView
 from client.views.history_actions import HistoryActions
 from client.views.history_dialog import MIN_REASON, HistoryDialog, revision_save_filter, revision_save_name
+from client.views.common import preview_html
+from client import updater
+from common.version import APP_VERSION
 from client.views.merge_dialog import MergeRequestDialog
+from client.views.notifications_dialog import NotificationsDialog
 from client.views.login_view import LoginView, PasswordChangeDialog, ask_forget_pin, ask_trust
 from client.views.project_dialogs import NewProjectDialog
 from client.views.sidebar import Sidebar
@@ -221,6 +225,7 @@ class MainWindow(QMainWindow):
         self.sidebar.new_project_requested.connect(self.new_project)
         self.sidebar.logout_requested.connect(self._logout)
         self.sidebar.password_requested.connect(self.change_password)
+        self.sidebar.notifications_requested.connect(lambda: self.show_notifications())
         self.dashboard.open_proposal.connect(self.open_proposal)
         self.dashboard.checkout_requested.connect(self.checkout)
         self.dashboard.merge_requested.connect(self.request_merge)
@@ -249,6 +254,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Automation Project Client · {api.user.display_name or api.user.username}")
         self.dashboard.set_enabled_project(False)
         self.load_projects()
+        self.refresh_unread()
+        self.check_for_update()
         self._hb.start()
 
     def show_help(self, topic: str = "") -> None:
@@ -429,8 +436,20 @@ class MainWindow(QMainWindow):
                                      + " e consultare cronologia e storico.")
             return
         wf = self.working_file
+        newer = self.newer_revision()
         self.dashboard.set_local(f"Copia di lavoro{' (branch)' if on_branch else ''}: rev base <b>{self.base_revision or '-'}</b>"
-                                 + (f" &nbsp;|&nbsp; {wf}" if wf else ""))
+                                 + (f" &nbsp;|&nbsp; {wf}" if wf else "")
+                                 + (f" &nbsp;|&nbsp; <span style='color:{T['ORANGE']}'><b>disponibile la rev {newer}</b>: "
+                                    "fai Checkout per aggiornarla</span>" if newer else ""))
+
+    def newer_revision(self) -> int:
+        """Revisione piu' recente sul server (principale o branch corrente) se la tua copia di lavoro e' rimasta indietro,
+        altrimenti 0 (anche se non hai ancora fatto il Checkout)."""
+        base = self.base_revision
+        if not base or self.api is None or self.project is None:
+            return 0
+        head = (self.branch.head_revision if self.branch else 0) if self.api.branch else (self.project.head_revision or 0)
+        return head if head > base else 0
 
     # ----------------------------------------------------------------- messaggi
     def _log(self, msg: str) -> None:
@@ -790,9 +809,11 @@ class MainWindow(QMainWindow):
         if self.base_revision == 0:
             QMessageBox.information(self, "Checkout necessario", "Esegui prima il Checkout dell'ultimo Master.")
             return
+        api, base = self.api, self.base_revision
         dlg = MergeRequestDialog(self.local_folder, self.working_file, self.base_revision,
                                  self.project.name if self.project else "", parent=self,
-                                 ext=self.master_ext, kind=self.master_kind, name=self.master_name)
+                                 ext=self.master_ext, kind=self.master_kind, name=self.master_name,
+                                 check_fn=lambda p: api.dry_run(p, base), run=self._run)
         if dlg.exec() != QDialog.Accepted or dlg.selected_path() is None:
             return
         self.submit_merge(dlg.selected_path(), dlg.message_text())
@@ -880,6 +901,7 @@ class MainWindow(QMainWindow):
         dlg.switch_requested.connect(self.switch_branch)
         dlg.sync_requested.connect(lambda s: self.sync_branch(s))
         dlg.merge_requested.connect(lambda s: self.merge_branch(s))
+        dlg.preview_requested.connect(lambda s, m: self.preview_branch(s, m))
         dlg.changed.connect(self.load_branches)
         dlg.created_branch.connect(self.on_branch_created)
         self.branches_dialog = dlg
@@ -901,6 +923,26 @@ class MainWindow(QMainWindow):
 
     def _branch_by_slug(self, slug: str) -> Optional[BranchOut]:
         return next((b for b in self.branches if b.slug == slug), None)
+
+    def preview_branch(self, slug: str, mode: str = "merge", show: bool = True):
+        """Anteprima (dry-run) dell'unione nel principale (``mode='merge'``) o dell'aggiornamento dal principale
+        (``'sync'``) di un branch: non crea nessuna richiesta. Mostra l'esito in una finestra (``show=False`` nei test)."""
+        api = self.api
+        if api is None or self.project is None:
+            return None
+        b = self._branch_by_slug(slug)
+        label = branch_display_name(b, slug)
+        what = "l'unione nel principale" if mode == "merge" else "l'aggiornamento dal principale"
+
+        def done(p) -> None:
+            self.last_preview = p
+            self._log(f"Anteprima {what} del branch «{label}»: "
+                      + ("nessuna differenza" if p.nothing_to_merge else f"{p.n_changes} modifiche, {p.n_conflicts} conflitti"))
+            if show:
+                QMessageBox.information(self, f"Anteprima · {label}", f"<b>{label}</b> — {what}<br><br>" + preview_html(p, what))
+        self._run(lambda: api.branch_dry_run(slug, mode), done, self._err)
+
+    last_preview = None                # ultima anteprima ricevuta (utile ai test)
 
     def sync_branch(self, slug: Optional[str] = None) -> None:
         """«Aggiorna dal principale»: richiesta di merge DENTRO il branch con le novita' del principale. Si resta
@@ -946,7 +988,8 @@ class MainWindow(QMainWindow):
                                      f"{self.project.name} › {label}", parent=self, ext=self.master_ext,
                                      kind=self.master_kind, name=self.master_name, title="Unisci nel principale",
                                      heading_text=f"Quale file vuoi unire nel principale dal branch «{label}»?",
-                                     ok_text="Unisci nel principale")
+                                     ok_text="Unisci nel principale", run=self._run,
+                                     check_fn=lambda p: api.branch_dry_run(slug, "merge", p))
             if dlg.exec() != QDialog.Accepted or dlg.selected_path() is None:
                 return
             path = str(dlg.selected_path())
@@ -1166,6 +1209,9 @@ class MainWindow(QMainWindow):
         t, msg, prop = ev.get("type"), ev.get("message", ""), ev.get("proposal")
         if t == "hello":
             return
+        if t == "notification":                                    # nuova notifica persistente per me
+            self._on_notification(ev)
+            return
         if t == "project_deleted":
             self._on_project_deleted(ev)
             return
@@ -1206,7 +1252,124 @@ class MainWindow(QMainWindow):
             self._on_merged(prop)                                  # mio merge con modifiche altrui -> reimport automatico
         if t == "master_updated" and ev.get("revision") is not None:
             self._auto_sync(int(ev["revision"]))
+            if self.api.branch:                                    # qualcuno ha salvato nel branch su cui lavori
+                self._on_branch_new_revision(int(ev["revision"]), msg)
         self.refresh_all()
+
+    def _on_branch_new_revision(self, rev: int, msg: str = "", delay_ms: int = 1500,
+                                ask: Optional[Callable[[str], bool]] = None) -> None:
+        """Un'altra persona ha salvato la rev ``rev`` nel branch in cui lavori: avvisa e propone di scaricarla (Checkout, che non
+        sovrascrive mai un file con modifiche tue). Dopo ``delay_ms`` si ricontrolla, cosi' un mio stesso salvataggio (che
+        aggiorna la revisione base) non genera l'avviso. ``ask`` sostituisce il dialogo (test)."""
+        slug = self.api.branch if self.api else None
+
+        def check() -> None:
+            if self.api is None or self.api.branch != slug or self.project_role < Role.DEVELOPER:
+                return
+            base = self.base_revision
+            if not base or rev <= base:
+                return
+            self._update_local_label()
+            text = (f"{msg or 'Nuova revisione nel branch'}.\n\nLa tua copia di lavoro è basata sulla rev {base}: "
+                    f"vuoi scaricare ora la rev {rev}? (il tuo file di lavoro con modifiche non verrà sovrascritto)")
+            if ask is not None:
+                if ask(text):
+                    self.checkout()
+                return
+            box = QMessageBox(QMessageBox.Question, "Nuova revisione nel branch", text, QMessageBox.Yes | QMessageBox.No, self)
+            box.button(QMessageBox.Yes).setText("Scarica ora")
+            box.button(QMessageBox.No).setText("Più tardi")
+            box.setAttribute(Qt.WA_DeleteOnClose)
+            box.setWindowModality(Qt.NonModal)
+            box.finished.connect(lambda r: self.checkout() if r == QMessageBox.Yes else None)
+            box.show()
+        if delay_ms <= 0:
+            check()
+        else:
+            QTimer.singleShot(delay_ms, check)
+
+    # ----------------------------------------------------------------- aggiornamento automatico del client
+    def check_for_update(self, ask: Optional[Callable[[str], bool]] = None) -> None:
+        """All'accesso chiede al server se esiste una versione piu' recente del client; se sì (e si usa l'eseguibile) propone
+        di aggiornare: scarica, verifica lo SHA-256, chiude l'app e la riavvia sostituita. ``ask`` sostituisce il dialogo (test)."""
+        api = self.api
+        if api is None:
+            return
+
+        def found(info) -> None:
+            if not info.available:
+                return
+            self.update_info = info
+            frozen = updater.running_exe() is not None
+            self._log(f"Disponibile una nuova versione del client: {info.version} (installata: {APP_VERSION})")
+            if not frozen:
+                return                                             # da sorgenti non c'e' un eseguibile da sostituire
+            text = (f"È disponibile la versione {info.version} del client (tu hai la {APP_VERSION}).\n\n"
+                    + (f"{info.notes}\n\n" if info.notes else "") + "Vuoi aggiornare ora? L'applicazione verrà riavviata.")
+            yes = ask(text) if ask is not None else QMessageBox.question(self, "Aggiornamento disponibile", text) == QMessageBox.Yes
+            if yes:
+                self.install_update(info)
+        self._run(lambda: updater.check(api), found, self._quiet_err)
+
+    update_info = None
+
+    def install_update(self, info, quit_app: bool = True) -> None:
+        api = self.api
+        if api is None:
+            return
+        self._log(f"Scarico il client {info.version}...")
+
+        def work():
+            return updater.download(api, info)
+
+        def done(path) -> None:
+            try:
+                updater.apply(path)
+            except updater.UpdateError as exc:
+                QMessageBox.warning(self, "Aggiornamento non riuscito", str(exc))
+                return
+            self._log("Aggiornamento pronto: riavvio dell'applicazione")
+            if quit_app:
+                QApplication.quit()
+        self._run(work, done, self._err)
+
+    # ----------------------------------------------------------------- notifiche (posta in arrivo)
+    def refresh_unread(self) -> None:
+        api = self.api
+        if api is None:
+            return
+        self._run(api.notifications_unread, lambda n: self.sidebar.set_unread(n), self._quiet_err)
+
+    def _on_notification(self, ev: dict) -> None:
+        self.sidebar.set_unread(int(ev.get("revision") or 0))
+        msg = ev.get("message", "")
+        self._log(f"Notifica: {msg}")
+        if self.tray:
+            self.tray.showMessage("Automation Project", msg)
+
+    def show_notifications(self) -> Optional[NotificationsDialog]:
+        if self.api is None:
+            return None
+        dlg = NotificationsDialog(self.api, self._run, self)
+        dlg.unread_changed.connect(lambda n: self.sidebar.set_unread(n))
+        dlg.open_requested.connect(self.open_notification)
+        self.notifications_dialog = dlg
+        dlg.exec()
+        self.refresh_unread()
+        return dlg
+
+    notifications_dialog = None
+
+    def open_notification(self, n) -> None:                        # noqa: ANN001  (NotificationOut)
+        """Apre la richiesta (o il branch) collegati a una notifica, passando prima al progetto / branch giusti."""
+        if self.api is None:
+            return
+        if n.project_id and (self.project is None or self.project.id != n.project_id):
+            self._select_project(n.project_id)
+        if n.project_id:
+            self.select_branch(n.branch or None)
+        if n.ref:
+            self.open_proposal(n.ref)
 
     def _on_comment_added(self, ev: dict) -> None:
         """Nuovo commento su una richiesta: avviso non bloccante se ne sono autore/partecipante o se sono @menzionato.

@@ -8,14 +8,14 @@ from typing import Optional
 from sqlalchemy import func, select
 
 from common.roles import ROLE_DESCRIPTIONS, ROLE_KEYS, Role
-from common.schemas import AuthSessionOut, RoleOut, TokenPair, UserCreate, UserOut, UserUpdate
+from common.schemas import AccountPolicy, AuthSessionOut, RoleOut, TokenPair, UserCreate, UserOut, UserUpdate
 from server.auth.models import AuthError, Principal
 from server.auth.security import (LoginThrottle, TokenError, TokenService, generate_password,
                                   hash_password, validate_password_policy, verify_password)
 from server.config import Settings
 from server.db.audit import AuditService
 from server.db.base import Database
-from server.db.models import AuthSession, RoleRow, User, seed_roles
+from server.db.models import AuthSession, RoleRow, ServerSetting, User, seed_roles
 
 
 CONSOLE_PREFIX = "console-"
@@ -32,9 +32,14 @@ def aware(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
-def user_out(u: User) -> UserOut:
+def user_out(u: User, max_age_days: int = 0) -> UserOut:
     r = Role(u.role.rank)
-    return UserOut(id=u.id, username=u.username, display_name=u.display_name, email=u.email, role=r.key,
+    changed = aware(u.password_changed_at) or aware(u.created_at)
+    locked = aware(u.locked_until)
+    return UserOut(locked_until=locked if locked and locked > _now() else None,
+                   password_changed_at=aware(u.password_changed_at),
+                   password_expires_at=changed + timedelta(days=max_age_days) if (max_age_days and changed) else None,
+                   id=u.id, username=u.username, display_name=u.display_name, email=u.email, role=r.key,
                    role_label=r.label, is_active=u.is_active, must_change_password=u.must_change_password,
                    created_at=aware(u.created_at), last_login_at=aware(u.last_login_at))
 
@@ -44,6 +49,32 @@ class AuthService:
         self.db, self.tokens, self.audit, self.cfg = db, tokens, audit, cfg
         self.throttle = LoginThrottle(cfg.max_login_failures, cfg.lockout_seconds)
         self._dummy_hash = hash_password("dummy-password-1", cfg.bcrypt_rounds)
+        self._max_age = 0                                  # scadenza password in giorni (0 = mai); vedi ``policy``
+
+    # ------------------------------------------------------------------ criteri account
+    def policy(self) -> AccountPolicy:
+        with self.db.scope() as s:
+            row = s.get(ServerSetting, "password_max_age_days")
+            try:
+                self._max_age = int(row.value) if row else 0
+            except ValueError:
+                self._max_age = 0
+        return AccountPolicy(password_max_age_days=self._max_age)
+
+    def set_policy(self, actor: Principal, data: AccountPolicy) -> AccountPolicy:
+        with self.db.scope() as s:
+            row = s.get(ServerSetting, "password_max_age_days")
+            if row is None:
+                s.add(ServerSetting(key="password_max_age_days", value=str(data.password_max_age_days)))
+            else:
+                row.value = str(data.password_max_age_days)
+        self._max_age = data.password_max_age_days
+        self.audit.record("account_policy_changed", actor.username, ip=actor.ip,
+                          details={"password_max_age_days": data.password_max_age_days})
+        return data
+
+    def _uo(self, u: User) -> UserOut:
+        return user_out(u, self._max_age)
 
     # ------------------------------------------------------------------ bootstrap
     def bootstrap(self) -> Optional[str]:
@@ -57,7 +88,7 @@ class AuthService:
             pw = pw or generate_password()
             validate_password_policy(pw)
             rid = s.scalar(select(RoleRow.id).where(RoleRow.rank == int(Role.ADMIN)))
-            s.add(User(username=self.cfg.admin_username.lower(), display_name="Project Administrator",
+            s.add(User(password_changed_at=_now(), username=self.cfg.admin_username.lower(), display_name="Project Administrator",
                        password_hash=hash_password(pw, self.cfg.bcrypt_rounds), role_id=rid,
                        must_change_password=generated))
         self.audit.record("user_created", "system", target=self.cfg.admin_username, details={"role": "Admin", "bootstrap": True})
@@ -69,7 +100,7 @@ class AuthService:
         return TokenPair(access_token=self.tokens.access(user.id, sid, user.username, role.key),
                          refresh_token=self.tokens.refresh(user.id, sid, jti),
                          expires_in=int(self.tokens.access_ttl.total_seconds()), session_id=sid,
-                         user=user_out(user))
+                         user=self._uo(user))
 
     def login(self, username: str, password: str, ip: str = "", client: str = "") -> TokenPair:
         key = username.strip().lower()
@@ -79,12 +110,35 @@ class AuthService:
             raise AuthError(429, f"Troppi tentativi falliti: riprova tra {int(wait) + 1} secondi")
         with self.db.scope() as s:
             user = s.scalar(select(User).where(User.username == key))
+            self.policy()
+            until = aware(user.locked_until) if user else None
+            if until and until > _now():                       # blocco persistente (sopravvive al riavvio del server)
+                secs = int((until - _now()).total_seconds())
+                self.audit.record("login_blocked", key, ip=ip, details={"retry_after_s": secs, "persistent": True})
+                raise AuthError(429, f"Account bloccato per troppi tentativi falliti: riprova tra {secs + 1} secondi "
+                                     "o chiedi a un amministratore di sbloccarlo")
             ok = verify_password(password, user.password_hash if user else self._dummy_hash)
             if not (user and ok and user.is_active):
                 self.throttle.fail(key)
+                locked = False
+                if user:
+                    user.failed_attempts = (user.failed_attempts or 0) + 1
+                    if user.failed_attempts >= self.cfg.max_login_failures:
+                        user.locked_until = _now() + timedelta(seconds=self.cfg.lockout_seconds)
+                        user.failed_attempts = 0
+                        locked = True
+                    s.commit()
                 self.audit.record("login_failed", key, ip=ip)
+                if locked:
+                    self.audit.record("account_locked", key, ip=ip, details={"seconds": int(self.cfg.lockout_seconds)})
                 raise AuthError(401, "Credenziali non valide")
             self.throttle.success(key)
+            user.failed_attempts, user.locked_until = 0, None
+            if self._max_age and not user.must_change_password:
+                changed = aware(user.password_changed_at) or aware(user.created_at)
+                if changed and _now() - changed > timedelta(days=self._max_age):
+                    user.must_change_password = True           # password scaduta: cambio obbligatorio al primo accesso
+                    self.audit.record("password_expired", key, ip=ip, details={"max_age_days": self._max_age})
             sid, jti = uuid.uuid4().hex, uuid.uuid4().hex
             now = _now()
             user.last_login_at = now
@@ -193,7 +247,8 @@ class AuthService:
 
     def list_users(self) -> list[UserOut]:
         with self.db.scope() as s:
-            return [user_out(u) for u in s.scalars(select(User).order_by(User.username))]
+            self.policy()
+            return [self._uo(u) for u in s.scalars(select(User).order_by(User.username))]
 
     def _role_id(self, s, role: str) -> int:                           # noqa: ANN001
         try:
@@ -213,11 +268,12 @@ class AuthService:
                 raise AuthError(409, f"Utente '{name}' gia' esistente")
             u = User(username=name, display_name=data.display_name.strip(), email=data.email.strip(),
                      password_hash=hash_password(data.password, self.cfg.bcrypt_rounds),
-                     role_id=self._role_id(s, data.role), must_change_password=data.must_change_password)
+                     role_id=self._role_id(s, data.role), must_change_password=data.must_change_password,
+                     password_changed_at=_now())
             s.add(u)
             s.flush()
             s.refresh(u)
-            out = user_out(u)
+            out = self._uo(u)
         self.audit.record("user_created", actor.username, target=name, ip=actor.ip, details={"role": out.role})
         return out
 
@@ -259,13 +315,18 @@ class AuthService:
                     raise AuthError(422, str(exc)) from exc
                 u.password_hash = hash_password(data.new_password, self.cfg.bcrypt_rounds)
                 u.must_change_password = True
+                u.password_changed_at = _now()
                 self._revoke_all(s, u.id)
                 changed["password_reset"] = True
             if data.must_change_password is not None:
                 u.must_change_password = data.must_change_password
+            if data.unlock:
+                u.failed_attempts, u.locked_until = 0, None
+                self.throttle.success(u.username)
+                changed["unlocked"] = True
             s.flush()
             s.refresh(u)
-            out, uname = user_out(u), u.username
+            out, uname = self._uo(u), u.username
         self.audit.record("user_updated", actor.username, target=uname, ip=actor.ip, details=changed)
         return out
 
@@ -304,6 +365,7 @@ class AuthService:
                 raise AuthError(403, "Password attuale errata")
             u.password_hash = hash_password(new, self.cfg.bcrypt_rounds)
             u.must_change_password = False
+            u.password_changed_at = _now()
             for sess in s.scalars(select(AuthSession).where(AuthSession.user_id == u.id)):
                 if sess.id != p.session_id:
                     sess.revoked = True                      # le altre sessioni vengono chiuse
@@ -311,4 +373,5 @@ class AuthService:
 
     def me(self, p: Principal) -> UserOut:
         with self.db.scope() as s:
-            return user_out(s.get(User, p.user_id))
+            self.policy()
+            return self._uo(s.get(User, p.user_id))

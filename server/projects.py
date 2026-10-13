@@ -104,6 +104,7 @@ class ProjectRegistry:
                 mgr.on_merged = lambda p, rev, pid=project_id: self.branches.on_main_merged(pid, p, rev)
                 mgr.finalize_guard = lambda p, pid=project_id: self.branches.main_finalize_guard(pid, p)
                 rt = self._rt[project_id] = ProjectRuntime(project_id, slug, store, mgr)
+                mgr.restore_pending()
             return rt
 
     def _branch_runtime(self, project_id: int, bslug: str) -> ProjectRuntime:
@@ -130,6 +131,7 @@ class ProjectRegistry:
         mgr.on_merged = lambda p, rev, pid=project_id, b=bslug: self.branches.on_branch_merged(pid, b, p, rev)
         mgr.finalize_guard = lambda p, pid=project_id, b=bslug: self.branches.branch_finalize_guard(pid, b, p)
         rt = self._brt[(project_id, bslug)] = ProjectRuntime(project_id, slug, store, mgr, bslug, info.kind, info.owner, info.name)
+        mgr.restore_pending()
         return rt
 
     def drop_branch_runtime(self, project_id: int, bslug: str) -> Optional[ProjectRuntime]:

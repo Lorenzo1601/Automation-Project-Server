@@ -17,9 +17,10 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request,
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from common.version import APP_VERSION
 from common.roles import Role
 from common.schemas import (AuditOut, AuditVerifyOut, DecisionIn, DeveloperOut, Event, MasterInfo,
-                            ProposalDetail, ProposalSummary, ResolutionsIn, RestoreIn)
+                            PreviewOut, ProposalDetail, ProposalSummary, ResolutionsIn, RestoreIn)
 from server.auth import routes as auth_routes
 from server.auth.models import AuthError, Principal, ProjectAccess
 from server.auth.rbac import effective_project_role, get_principal, min_role, project_access
@@ -32,7 +33,9 @@ from server.db.models import Project, User
 from common.filekinds import L5K, L5X, PLCOPEN, detect_kind, l5k_controller_name, media_type, rev_filename
 from server.merger import L5XError, Resolution, parse_l5x
 from server.plcopen import plcopen_identity
+from server.inbox import InboxService, build_router as inbox_router
 from server.notifier import Notifier
+from server.updates import build_router as updates_router
 from server.branches import build_router as branches_router, check_write as check_branch_write
 from server.projects import BranchNotFound, ProjectGone, ProjectRegistry, ProjectRuntime
 from server.projects import build_router as projects_router
@@ -61,6 +64,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                           timedelta(minutes=cfg.access_ttl_min), timedelta(hours=cfg.refresh_ttl_h))
     auth = AuthService(db, tokens, audit, cfg)
     notifier = Notifier()
+    inbox = InboxService(db, cfg, notifier)
+    notifier.inbox = inbox
     registry = ProjectRegistry(cfg, db, notifier, audit)
     bootstrap_pw = auth.bootstrap()
 
@@ -78,8 +83,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         task.cancel()
         db.dispose()
 
-    app = FastAPI(title="Automation Project Server", version="2.0", lifespan=lifespan)
-    for k, v in dict(db=db, audit=audit, auth=auth, registry=registry, notifier=notifier, settings=cfg,
+    app = FastAPI(title="Automation Project Server", version=APP_VERSION, lifespan=lifespan)
+    for k, v in dict(db=db, audit=audit, auth=auth, registry=registry, notifier=notifier, inbox=inbox, settings=cfg,
                      bootstrap_password=bootstrap_pw).items():
         setattr(app.state, k, v)
 
@@ -100,6 +105,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return JSONResponse(status_code=exc.status, content={"detail": exc.message})
 
     app.include_router(auth_routes.build_router())
+    app.include_router(inbox_router())
+    app.include_router(updates_router(audit))
     app.include_router(projects_router())
 
     @app.get("/api/health", tags=["server"])
@@ -219,6 +226,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(413, "File troppo grande")
         p = await run_in_threadpool(c.rt.mgr.submit, c.dev, data, base_revision, message)
         return c.rt.mgr.detail(p)
+
+    @app.post(P + "/proposals/dry-run", response_model=PreviewOut, tags=["merge"])
+    async def dry_run(file: UploadFile = File(...), base_revision: int = Form(...), c: Ctx = Depends(ctx(Role.DEVELOPER))):
+        """Anteprima del merge (conflitti inclusi) senza inviare la richiesta."""
+        data = await file.read()
+        if len(data) > cfg.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, "File troppo grande")
+        return await run_in_threadpool(c.rt.mgr.dry_run, data, base_revision)
 
     @app.get(P + "/proposals", response_model=list[ProposalSummary], tags=["merge"])
     def proposals(active_only: bool = Query(False), c: Ctx = Depends(ctx(Role.VIEWER))):

@@ -202,10 +202,12 @@ class UserMgmtView(QWidget):
         self.btn_edit = QPushButton("Modifica...")
         self.btn_toggle = QPushButton("Disattiva")
         self.btn_toggle.setProperty("variant", "danger")
+        self.btn_unlock = QPushButton("Sblocca")
+        self.btn_unlock.setToolTip("Sblocca l'account bloccato per troppi tentativi di accesso falliti")
         self.btn_delete_user = QPushButton("Elimina utente...")
         self.btn_delete_user.setProperty("variant", "danger")
         self.btn_delete_user.setToolTip("Elimina definitivamente l'utente (solo Admin). Non puoi eliminare te stesso né l'ultimo amministratore")
-        for b in (self.btn_new, self.btn_edit, self.btn_toggle, self.btn_delete_user):
+        for b in (self.btn_new, self.btn_edit, self.btn_toggle, self.btn_unlock, self.btn_delete_user):
             bar.addWidget(b)
         bar.addStretch(1)
         l.addLayout(bar)
@@ -216,7 +218,21 @@ class UserMgmtView(QWidget):
         self.users_table.setColumnWidth(4, 140)
         self.users_table.setColumnWidth(5, 170)
         l.addWidget(self.users_table, 1)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Scadenza password:"))
+        self.spin_pw_age = QSpinBox()
+        self.spin_pw_age.setRange(0, 3650)
+        self.spin_pw_age.setSpecialValueText("mai")
+        self.spin_pw_age.setSuffix(" giorni")
+        self.spin_pw_age.setToolTip("0 = le password non scadono. Alla scadenza l'utente deve cambiarla al primo accesso")
+        self.btn_pw_age = QPushButton("Applica")
+        prow.addWidget(self.spin_pw_age)
+        prow.addWidget(self.btn_pw_age)
+        prow.addWidget(muted("Opzionale: la scadenza vale per tutti gli utenti e la decide un amministratore."), 1)
+        l.addLayout(prow)
         self.tabs.addTab(w, "Utenti")
+        self.btn_unlock.clicked.connect(lambda _c=False: self.unlock_user())
+        self.btn_pw_age.clicked.connect(lambda _c=False: self.apply_password_age())
         self.btn_new.clicked.connect(self.new_user)
         self.btn_edit.clicked.connect(self.edit_user)
         self.btn_toggle.clicked.connect(self.toggle_user)
@@ -226,6 +242,7 @@ class UserMgmtView(QWidget):
 
     def _fill_users(self, users: list[UserOut]) -> None:
         self._users = users
+        self._run(self.api.account_policy, lambda p: self.spin_pw_age.setValue(p.password_max_age_days), lambda _e: None)
         t = self.users_table
         t.setRowCount(len(users))
         for r, u in enumerate(users):
@@ -236,7 +253,9 @@ class UserMgmtView(QWidget):
             state = "Attivo" if u.is_active else "Disattivato"
             if u.is_active and u.must_change_password:
                 state = "Cambio password"
-            t.setItem(r, 4, item(state, T["GREEN"] if u.is_active else T["RED"]))
+            if u.is_active and u.locked_until:
+                state = "Bloccato"
+            t.setItem(r, 4, item(state, T["GREEN"] if (u.is_active and not u.locked_until) else T["RED"]))
             t.setItem(r, 5, item(full_time(u.last_login_at) if u.last_login_at else "mai", T["MUTED"]))
         self._sel_changed()
 
@@ -249,6 +268,7 @@ class UserMgmtView(QWidget):
         self.btn_edit.setEnabled(u is not None)
         self.btn_toggle.setEnabled(u is not None and u.id != self.api.user.id)
         self.btn_delete_user.setEnabled(u is not None and u.id != self.api.user.id)
+        self.btn_unlock.setEnabled(u is not None and bool(u.locked_until))
         self.btn_toggle.setText("Riattiva" if (u and not u.is_active) else "Disattiva")
         self.btn_toggle.setProperty("variant", "success" if (u and not u.is_active) else "danger")
         self.btn_toggle.style().unpolish(self.btn_toggle)
@@ -284,6 +304,21 @@ class UserMgmtView(QWidget):
             return
         self._run(lambda: self.api.update_user(u.id, UserUpdate(is_active=target)),
                   lambda _x: self.reload(), self._err)
+
+    def unlock_user(self) -> None:
+        u = self._selected_user()
+        if u is None or not u.locked_until:
+            return
+        self._run(lambda: self.api.unlock_user(u.id),
+                  lambda x: (self.status.emit(f"Account {x.username} sbloccato"), self.reload()), self._err)
+
+    def apply_password_age(self, days: Optional[int] = None) -> None:
+        days = self.spin_pw_age.value() if days is None else days
+        self._run(lambda: self.api.set_account_policy(days),
+                  lambda p: (self.spin_pw_age.setValue(p.password_max_age_days),
+                             self.status.emit("Le password non scadono" if not p.password_max_age_days
+                                              else f"Le password scadono dopo {p.password_max_age_days} giorni"),
+                             self.reload()), self._err)
 
     def delete_user(self, confirm: Optional[bool] = None) -> None:
         """Elimina definitivamente l'utente selezionato (solo Admin). ``confirm`` salta la domanda (test)."""

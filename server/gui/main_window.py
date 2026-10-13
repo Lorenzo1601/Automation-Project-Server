@@ -10,8 +10,8 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCursor, QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, QStackedWidget,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
+                               QMessageBox, QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, QStackedWidget,
                                QVBoxLayout, QWidget)
 
 from client.api_client import ApiError
@@ -221,6 +221,8 @@ class SettingsPage(QWidget):
     autostart_changed = Signal(bool)
     service_action = Signal(str)                      # install | start | stop | remove
     backup_requested = Signal()
+    publish_client_requested = Signal()
+    unpublish_client_requested = Signal()
     tls_generate_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -357,6 +359,30 @@ class SettingsPage(QWidget):
         brow.addStretch(1)
         kl.addLayout(brow)
         lay.addWidget(bk)
+
+        up = QFrame()
+        up.setObjectName("Panel")
+        ul = QVBoxLayout(up)
+        ul.setContentsMargins(18, 14, 18, 14)
+        ul.setSpacing(8)
+        ul.addWidget(_label("AGGIORNAMENTO DEL CLIENT"))
+        ul.addWidget(muted("Pubblica qui l'ultimo AutomationProjectClient.exe: i client collegati lo trovano all'accesso e "
+                           "si aggiornano da soli (con conferma dell'utente e verifica SHA-256)."))
+        self.lbl_client_update = QLabel("Nessun client pubblicato.")
+        self.lbl_client_update.setStyleSheet("font-weight:600;")
+        ul.addWidget(self.lbl_client_update)
+        urow = QHBoxLayout()
+        self.btn_publish_client = QPushButton("  Pubblica nuovo client...")
+        self.btn_publish_client.setIcon(icon("upload", T["TEXT"], 18))
+        self.btn_unpublish_client = QPushButton("Rimuovi")
+        self.btn_unpublish_client.setProperty("variant", "ghost")
+        self.btn_publish_client.clicked.connect(self.publish_client_requested)
+        self.btn_unpublish_client.clicked.connect(self.unpublish_client_requested)
+        urow.addWidget(self.btn_publish_client)
+        urow.addWidget(self.btn_unpublish_client)
+        urow.addStretch(1)
+        ul.addLayout(urow)
+        lay.addWidget(up)
 
         svc = QFrame()
         svc.setObjectName("Panel")
@@ -563,6 +589,8 @@ class ServerWindow(QMainWindow):
         self.settings_page.tls_generate_requested.connect(self.generate_certificate)
         self.settings_page.service_action.connect(self.service_action)
         self.settings_page.backup_requested.connect(self.create_backup)
+        self.settings_page.publish_client_requested.connect(lambda: self.publish_client())
+        self.settings_page.unpublish_client_requested.connect(lambda: self.unpublish_client())
         self.settings_page.autostart_changed.connect(lambda v: setattr(self.prefs, "autostart", v))
         self.audit.query_requested.connect(self._audit_query)
         self.audit.verify_requested.connect(self._audit_verify)
@@ -650,6 +678,7 @@ class ServerWindow(QMainWindow):
         api = srv.console
         self.status.set_clients(srv.connections())
         self.refresh_service_status()
+        self.refresh_client_update()
 
         def work():
             return api.users(), api.projects(), api.audit(limit=12)
@@ -838,6 +867,45 @@ class ServerWindow(QMainWindow):
             self.statusBar().showMessage(f"Backup creato: {res} ({size:.1f} MB). Contiene il segreto JWT: conservalo "
                                          "in un posto protetto.", 15000)
         self._run(lambda: srv.backup(dest), ok, self._backup_error)
+
+    def refresh_client_update(self) -> None:
+        srv = self.server
+        info = srv.client_update() if srv is not None else None
+        sp = self.settings_page
+        if info is not None and info.version:
+            sp.lbl_client_update.setText(f"Pubblicato: versione {info.version} ({info.size / (1024 * 1024):.1f} MB, {info.filename})")
+        else:
+            sp.lbl_client_update.setText("Nessun client pubblicato.")
+        sp.btn_unpublish_client.setEnabled(bool(info and info.version))
+
+    def publish_client(self, exe: Optional[str] = None, version: Optional[str] = None, notes: Optional[str] = None) -> None:
+        """Pubblica un nuovo eseguibile del client (parametri iniettabili nei test)."""
+        srv = self.server
+        if srv is None:
+            return
+        if exe is None:
+            exe, _ = QFileDialog.getOpenFileName(self, "Seleziona AutomationProjectClient.exe", "", "Eseguibile (*.exe);;Tutti i file (*)")
+        if not exe:
+            return
+        if version is None:
+            from common.version import APP_VERSION
+            version, ok = QInputDialog.getText(self, "Versione del client", "Numero di versione (es. 2.1):", text=APP_VERSION)
+            if not ok:
+                return
+            notes, _ok = QInputDialog.getText(self, "Note di versione", "Cosa cambia (facoltativo):")
+        try:
+            info = srv.publish_client_update(exe, version, notes or "")
+        except Exception as exc:                                        # noqa: BLE001
+            QMessageBox.warning(self, "Pubblicazione non riuscita", str(exc))
+            return
+        self.refresh_client_update()
+        self.statusBar().showMessage(f"Client {info.version} pubblicato: i client collegati lo proporranno all'accesso", 10000)
+
+    def unpublish_client(self) -> None:
+        srv = self.server
+        if srv is not None and srv.remove_client_update():
+            self.statusBar().showMessage("Aggiornamento del client rimosso", 6000)
+        self.refresh_client_update()
 
     def _backup_error(self, exc: Exception) -> None:
         self.statusBar().showMessage("Backup non riuscito", 8000)

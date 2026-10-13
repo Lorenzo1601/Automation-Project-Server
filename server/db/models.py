@@ -41,10 +41,20 @@ class User(Base):
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")     # tentativi falliti consecutivi
+    locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)   # account bloccato fino a
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     role: Mapped[RoleRow] = relationship(lazy="joined")
     permissions: Mapped[list["ProjectPermission"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", foreign_keys="ProjectPermission.user_id")
+
+
+class ServerSetting(Base):
+    """Impostazioni del server modificabili a runtime (chiave/valore), es. scadenza delle password."""
+    __tablename__ = "server_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
 
 
 class Project(Base):
@@ -141,4 +151,5 @@ def seed_roles(session) -> None:                                         # noqa:
 
 # ---- tabelle di altri moduli: registrate qui perche' ``create_all`` importi solo ``models``
 from server.db import models_comments  # noqa: E402,F401  (proposal_comments: discussione sulle richieste)
+from server.db import models_inbox  # noqa: E402,F401  (notifications: posta in arrivo)
 from server.db import models_branches  # noqa: E402,F401  (branches: linee alternative del Master)

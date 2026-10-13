@@ -24,18 +24,20 @@ e vengono eseguiti dal threadpool di FastAPI.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from common.roles import Role
 from common.schemas import (ACTIVE_STATES, STATE_LABELS, ChangeOut, ConflictOut, DeveloperOut,
                             Event, MasterInfo, ParticipantOut, ProposalDetail, ProposalState,
-                            ProposalSummary)
+                            PreviewConflict, PreviewOut, ProposalSummary)
 from common.filekinds import (KIND_LABELS, L5K, L5X, MERGEABLE, PLCOPEN, canonical_ext, compatible_kinds, detect_kind,
                               l5k_controller_name)
 from server.textmerge import merge_any
@@ -124,6 +126,7 @@ class SessionManager:
         self.extra_protect: Callable[[], set[int]] = lambda: set()    # revisioni da non potare (basi dei branch aperti)
         self.on_merged: Optional[Callable[[Proposal, Revision], None]] = None       # richiesta consolidata in una revisione
         self.finalize_guard: Optional[Callable[[Proposal], Optional[str]]] = None   # motivo per annullare invece di consolidare
+        self._restoring = False
         self.auto_approve = False       # branch personale: consenso del solo autore, dato in automatico se non ci sono conflitti
 
     def _log_audit(self, action: str, actor: str, target: str = "", **details) -> None:
@@ -285,6 +288,33 @@ class SessionManager:
             self._audit()
             self._auto_approve(p)
             return p
+
+    def dry_run(self, data: bytes, base_revision: int, *, base_data: Optional[bytes] = None, swap: bool = False) -> PreviewOut:
+        """Anteprima di un merge: esegue lo stesso 3-way di ``submit`` senza creare la richiesta ne' toccare nulla."""
+        with self._lock:
+            if not self.store.initialized:
+                raise SessionError(409, "Master non inizializzato")
+            if base_data is None:
+                if self.store.is_purged(base_revision):
+                    raise SessionError(409, f"La revisione base {base_revision} non e' piu' conservata dal server: "
+                                            "esegui il Checkout dell'ultimo Master")
+                if not self.store.has_revision(base_revision):
+                    raise SessionError(422, f"Revisione base {base_revision} inesistente")
+            head = self.store.head()
+            got = detect_kind(data)
+            if head.kind in MERGEABLE and not compatible_kinds(head.kind, got):
+                raise SessionError(422, f"Il file e' di tipo «{KIND_LABELS[got]}» ma il Master e' «{KIND_LABELS[head.kind]}»")
+            try:
+                base = base_data if base_data is not None else self.store.read_revision(base_revision)
+                res = self._run_merge(head.kind, base, data, self.store.read_revision(head.revision), swap)
+            except L5XError as exc:
+                raise SessionError(422, str(exc)) from exc
+            return PreviewOut(
+                head_revision=head.revision, n_changes=len(res.changes), n_upstream=len(res.upstream_changes),
+                n_conflicts=len(res.conflicts), touched=res.touched_routines[:30], warnings=res.warnings[:30],
+                conflicts=[PreviewConflict(path=c.path, title=c.title, label=c.label, kind=c.kind) for c in res.conflicts],
+                clean=not res.conflicts,
+                nothing_to_merge=not res.changes and not res.conflicts and not (swap and res.upstream_changes))
 
     def _auto_approve(self, p: Proposal) -> None:
         """Branch personale: se non restano conflitti il consenso dell'autore e' dato in automatico (consolida subito)."""
@@ -557,6 +587,97 @@ class SessionManager:
 
     def _touch(self, p: Proposal) -> None:
         p.updated_at = _now()
+        self._persist()
+
+    # ---- persistenza delle richieste attive: sopravvivono al riavvio del server
+    def _persist(self) -> None:
+        """Salva su disco (``pending.json``) le richieste ancora aperte; le chiuse restano solo nell'audit."""
+        if self._restoring:
+            return
+        recs = []
+        for p in self._proposals.values():
+            if p.state not in ACTIVE_STATES:
+                continue
+            if p.base_data is not None:
+                try:
+                    (self.store.prop_dir / f"{p.id}.base").write_bytes(p.base_data)
+                except OSError:
+                    pass
+            recs.append({
+                "id": p.id, "author_session": p.author_session, "author": p.author, "base_revision": p.base_revision,
+                "message": p.message, "created_at": p.created_at.isoformat(), "updated_at": p.updated_at.isoformat(),
+                "file_path": p.file_path, "author_role": int(p.author_role), "needs_lead": p.needs_lead,
+                "required": p.required, "meta": p.meta, "swap": p.swap, "has_base": p.base_data is not None,
+                "log": p.log[-40:],
+                "resolutions": {k: {"choice": r.choice, "custom": r.custom, "fingerprint": r.fingerprint}
+                                for k, r in p.resolutions.items()},
+                "approvals": {sid: {"developer": a.developer, "decision": a.decision, "comment": a.comment,
+                                    "at": a.at.isoformat(), "digest": a.digest} for sid, a in p.approvals.items()},
+                "lead_approval": ({"session_id": p.lead_approval.session_id, "developer": p.lead_approval.developer,
+                                   "comment": p.lead_approval.comment, "at": p.lead_approval.at.isoformat(),
+                                   "digest": p.lead_approval.digest} if p.lead_approval else None),
+            })
+        try:
+            tmp = self.store.root / "pending.json.tmp"
+            tmp.write_text(json.dumps(recs, default=str), "utf-8")
+            tmp.replace(self.store.root / "pending.json")
+        except OSError:
+            logging.getLogger("aps.session").exception("Salvataggio delle richieste in sospeso non riuscito")
+
+    def restore_pending(self) -> list[str]:
+        """Ricarica le richieste aperte salvate da ``_persist`` (da chiamare dopo aver impostato i gancio del registry).
+        Ogni richiesta viene rianalizzata sulla testa corrente; i consensi restano validi solo se il risultato e' identico."""
+        path = self.store.root / "pending.json"
+        if not path.exists() or not self.store.initialized:
+            return []
+        try:
+            recs = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return []
+        restored: list[str] = []
+        with self._lock:
+            self._restoring = True
+            try:
+                for r in recs:
+                    try:
+                        base_data = None
+                        if r.get("has_base"):
+                            base_data = (self.store.prop_dir / f"{r['id']}.base").read_bytes()
+                        p = Proposal(
+                            id=r["id"], author_session=r["author_session"], author=r["author"],
+                            base_revision=r["base_revision"], message=r.get("message", ""),
+                            created_at=datetime.fromisoformat(r["created_at"]),
+                            updated_at=datetime.fromisoformat(r["updated_at"]), state=ProposalState.AWAITING_CONSENT,
+                            file_path=r["file_path"], required=dict(r.get("required", {})),
+                            author_role=Role(r.get("author_role", int(Role.DEVELOPER))),
+                            needs_lead=bool(r.get("needs_lead")), meta=dict(r.get("meta", {})),
+                            base_data=base_data, swap=bool(r.get("swap")), log=list(r.get("log", [])),
+                            resolutions={k: Resolution(v["choice"], v.get("custom"), fingerprint=v.get("fingerprint"))
+                                         for k, v in r.get("resolutions", {}).items()})
+                        self._proposals[p.id] = p
+                        head = self.store.head()
+                        mine = Path(p.file_path).read_bytes()
+                        base = base_data if base_data is not None else self.store.read_revision(p.base_revision)
+                        res = self._run_merge(head.kind, base, mine, self.store.read_revision(head.revision), p.swap,
+                                              p.resolutions)
+                        self._apply_result(p, res, head.revision, "Richiesta ripristinata dopo il riavvio del server")
+                        mk = lambda a: Approval(a.get("session_id", ""), a["developer"], a["decision"], a.get("comment", ""),
+                                                datetime.fromisoformat(a["at"]), a["digest"])
+                        if p.result is not None:
+                            for sid, a in r.get("approvals", {}).items():
+                                if a["digest"] == p.result.digest:
+                                    p.approvals[sid] = mk({**a, "session_id": sid})
+                            la = r.get("lead_approval")
+                            if la and la["digest"] == p.result.digest:
+                                p.lead_approval = mk(la)
+                        restored.append(p.id)
+                    except Exception as exc:                  # noqa: BLE001  (file mancante / non piu' analizzabile)
+                        self._proposals.pop(r.get("id", ""), None)
+                        logging.getLogger("aps.session").warning("Richiesta %s non ripristinata: %s", r.get("id"), exc)
+            finally:
+                self._restoring = False
+            self._persist()
+        return restored
 
     def _set_state(self, p: Proposal, st: ProposalState, log: str) -> None:
         p.state = st
