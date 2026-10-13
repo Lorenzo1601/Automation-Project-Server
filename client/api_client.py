@@ -224,6 +224,9 @@ class ApiClient:
     def create_user(self, data: UserCreate) -> UserOut:
         return UserOut(**self._req("POST", "/api/users", json=data.model_dump()).json())
 
+    def delete_user(self, uid: int) -> None:
+        self._req("DELETE", f"/api/users/{uid}")
+
     def update_user(self, uid: int, data: UserUpdate) -> UserOut:
         return UserOut(**self._req("PATCH", f"/api/users/{uid}", json=data.model_dump(exclude_none=True)).json())
 
@@ -433,14 +436,27 @@ class ApiClient:
                           files={"file": (file.name, f, "application/octet-stream")})
         return MasterInfo(**r.json())
 
+    def branch_save(self, slug: str, file: Path, message: str, base_revision: Optional[int] = None) -> ProposalDetail:
+        """«Salva su branch» in un branch di TEAM: unione 3-way con la testa del branch e consenso automatico dell'autore."""
+        data = {"message": message, **({"base_revision": base_revision} if base_revision else {})}
+        with open(file, "rb") as f:
+            r = self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/save", data=data,
+                          files={"file": (Path(file).name, f, "application/xml")})
+        return ProposalDetail(**r.json())
+
     def branch_sync(self, slug: str) -> ProposalDetail:
         """«Aggiorna dal principale»: porta nel branch le novita' del principale (richiesta di merge NEL branch)."""
         return ProposalDetail(**self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/sync").json())
 
-    def branch_merge(self, slug: str, message: str = "") -> ProposalDetail:
-        """«Unisci nel principale»: richiesta di merge del branch NEL principale (consenso normale)."""
-        return ProposalDetail(**self._req("POST", f"/api/projects/{self.project_id}/branches/{slug}/merge",
-                                          data={"message": message}).json())
+    def branch_merge(self, slug: str, message: str = "", file: Optional[Path] = None) -> ProposalDetail:
+        """«Unisci nel principale»: richiesta di merge del branch NEL principale (consenso normale). Con ``file`` si
+        invia quella versione di lavoro al posto della testa del branch."""
+        url = f"/api/projects/{self.project_id}/branches/{slug}/merge"
+        if file is None:
+            return ProposalDetail(**self._req("POST", url, data={"message": message}).json())
+        with open(file, "rb") as f:
+            return ProposalDetail(**self._req("POST", url, data={"message": message},
+                                              files={"file": (Path(file).name, f, "application/xml")}).json())
 
     def close_branch(self, slug: str, pid: Optional[int] = None) -> BranchOut:
         return BranchOut(**self._req("POST", f"/api/projects/{self._bp(pid)}/branches/{slug}/close").json())

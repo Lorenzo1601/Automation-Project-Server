@@ -62,4 +62,8 @@ def build_router() -> APIRouter:
     def update_user(uid: int, body: UserUpdate, request: Request, p: Principal = Depends(min_role(Role.ADMIN))):
         return svc(request).update_user(p, uid, body)
 
+    @r.delete("/users/{uid}", status_code=204)
+    def delete_user(uid: int, request: Request, p: Principal = Depends(min_role(Role.ADMIN))):
+        svc(request).delete_user(p, uid)
+
     return r

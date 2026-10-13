@@ -246,6 +246,8 @@ ruolo dell'account o uno inferiore, mai uno superiore. Senza un permesso sul pro
           "<b>Admin</b>: tutto, in ogni progetto. Il ruolo Admin esiste solo a livello di account."])}
 <p>Il ruolo viene riletto dal server a ogni richiesta: se un Admin ti declassa o ti disattiva, la modifica ha
 <b>effetto immediato</b>. Non si può rimuovere l'ultimo Admin né declassare o disattivare se stessi.</p>
+<h2>Eliminare un utente</h2>
+<p>Solo l'<b>Admin</b>, da <b>Utenti &amp; Permessi</b> con {ui('Elimina utente...')}: l'account sparisce con le sue sessioni e i suoi permessi di progetto. Cronologia eventi, commenti e branch già creati restano con il suo nome; l'azione è registrata nella cronologia. Non puoi eliminare te stesso né l'ultimo Admin. Per sospendere solo l'accesso usa {ui('Disattiva')}.</p>
 """
 
 
@@ -631,14 +633,14 @@ finché non unisci un branch. Si sceglie dal menu <b>BRANCH</b> nella barra late
     ["Personale", role_pill("Developer") + " " + role_pill("Lead") + " " + role_pill("Admin"),
      "Scrive solo il proprietario (o un Admin) con " + ui("Salva su branch...") + ". Massimo 5 aperti per utente e progetto. Le richieste di aggiornamento hanno il solo tuo consenso, automatico se non ci sono conflitti."],
     ["Di team", role_pill("Lead") + " " + role_pill("Admin"),
-     "Come il principale: richieste di merge e consenso degli altri sviluppatori."],
+     "Scrivono tutti i Developer. " + ui("Salva su branch...") + " unisce le tue modifiche a quelle già nel branch (senza perdere il lavoro dei colleghi) e le salva subito, senza votazione: i colleghi le trovano con il Checkout del branch. Se c'è un conflitto sulla stessa riga la richiesta resta da risolvere. Resta possibile anche " + ui("Richiedi Merge...") + " per chiedere il consenso. Il consenso serve comunque per unire nel principale."],
 ], [18, 30, 52])}
 {bullets(["Un branch nasce dalla <b>testa del principale</b> (o da una revisione conservata a tua scelta): la sua rev 1 è una copia di quella revisione.",
           ui("Aggiorna dal principale") + ": porta nel branch le novità del principale con un merge a tre vie; se ci sono conflitti li risolvi come al solito.",
-          ui("Unisci nel principale...") + ": crea una richiesta di merge nel principale, con il consenso normale. A merge avvenuto il branch diventa «unito» e resta in sola lettura.",
+          ui("Unisci nel principale...") + ": si apre la stessa finestra di Richiedi Merge per scegliere il file da inviare (di norma il file di lavoro del branch); se è diverso dalla testa, nel tuo branch personale viene prima salvato; in un branch di team il file viene inviato direttamente nella richiesta di merge nel principale. Poi parte la richiesta di merge nel principale, con il consenso normale. A merge avvenuto il branch diventa «unito» e resta in sola lettura.",
           "<b>Chiudi</b> rende il branch di sola lettura; <b>Elimina</b> lo rimuove con tutti i suoi file (proprietario, Admin, e i Lead per i branch di team).",
           "Nell'elenco vedi quante revisioni il branch ha <b>dietro</b> (novità del principale) e <b>avanti</b>.",
-          "Sul tuo PC ogni branch ha la sua cartella " + mono("&lt;cartella locale&gt;/branches/&lt;nome&gt;/") + " con la propria " + mono(".aps") + "."])}
+          "Passando a un branch per la prima volta ne scarichi subito l'ultima versione. Sul tuo PC ogni branch ha la sua cartella " + mono("&lt;cartella locale&gt;/branches/&lt;nome&gt;/") + " con la propria " + mono(".aps") + "."])}
 {warn("Se il branch cambia dopo che hai chiesto l'unione, la richiesta viene annullata: rifalla. I file binari si salvano e si versionano nei branch personali ma non si possono unire con il merge.")}
 <p>Le revisioni del principale da cui partono i branch aperti non vengono eliminate dal limite di revisioni
 (vedi {link("retention", "Revisioni conservate e pulizia")}). Le operazioni sono nella {link("audit", "cronologia eventi")}.</p>

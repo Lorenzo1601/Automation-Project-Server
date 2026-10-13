@@ -220,9 +220,11 @@ class SessionManager:
         return merge_any(kind, base, incoming, head_bytes, resolutions)
 
     def submit(self, dev: Developer, data: bytes, base_revision: int, message: str = "", *,
-               base_data: Optional[bytes] = None, meta: Optional[dict] = None, swap: bool = False) -> Proposal:
+               base_data: Optional[bytes] = None, meta: Optional[dict] = None, swap: bool = False,
+               auto: bool = False) -> Proposal:
         """Nuova richiesta di merge. ``base_data``: base del 3-way presa da fuori (sync di un branch: e' una revisione del
-        principale, ``base_revision`` ne e' solo il numero mostrato); ``meta``: vedi ``Proposal``; ``swap``: vedi ``_run_merge``."""
+        principale, ``base_revision`` ne e' solo il numero mostrato); ``meta``: vedi ``Proposal``; ``swap``: vedi ``_run_merge``; ``auto``: consenso del solo autore, dato in
+        automatico se non ci sono conflitti (salvataggio nel branch di team)."""
         with self._lock:
             if dev.role < Role.DEVELOPER:
                 raise SessionError(403, "I Viewer non possono inviare richieste di merge")
@@ -249,6 +251,9 @@ class SessionManager:
                 raise SessionError(422, "Nessuna modifica da proporre rispetto al Master")
 
             meta = dict(meta or {})
+            if auto:
+                meta["auto"] = True
+            solo = self.auto_approve or auto
             for old in [p for p in self._proposals.values()
                         if p.author_session == dev.session_id and p.state in ACTIVE_STATES
                         and p.meta.get("kind", "normal") == meta.get("kind", "normal")
@@ -259,13 +264,13 @@ class SessionManager:
             pid = uuid.uuid4().hex[:10]
             path = self.store.save_upload(pid, data)
             required = {dev.session_id: dev.name}
-            if not self.auto_approve:                     # branch personale: consenso del solo autore
+            if not solo:                                  # branch personale / salvataggio: consenso del solo autore
                 required.update({d.session_id: d.name for d in self._devs.values()
                                  if d.session_id != dev.session_id and d.role >= Role.DEVELOPER and self._alive(d)})
             p = Proposal(id=pid, author_session=dev.session_id, author=dev.name, base_revision=base_revision,
                          message=message, created_at=_now(), updated_at=_now(),
                          state=ProposalState.AWAITING_CONSENT, file_path=str(path), required=required,
-                         author_role=dev.role, needs_lead=self.require_lead_approval and not self.auto_approve and dev.role < Role.LEAD,
+                         author_role=dev.role, needs_lead=self.require_lead_approval and not solo and dev.role < Role.LEAD,
                          meta=meta, base_data=base_data, swap=swap)
             self._proposals[pid] = p
             self._apply_result(p, result, head.revision, reason=None)
@@ -283,11 +288,11 @@ class SessionManager:
 
     def _auto_approve(self, p: Proposal) -> None:
         """Branch personale: se non restano conflitti il consenso dell'autore e' dato in automatico (consolida subito)."""
-        if not self.auto_approve or p.state != ProposalState.AWAITING_CONSENT or (p.result and p.result.unresolved):
+        if not (self.auto_approve or p.meta.get("auto")) or p.state != ProposalState.AWAITING_CONSENT or (p.result and p.result.unresolved):
             return
         author = self._devs.get(p.author_session)
         if author is not None:
-            self.approve(author, p.id, "Approvazione automatica (branch personale)")
+            self.approve(author, p.id, "Approvazione automatica (branch personale / salvataggio nel branch)")
 
     def cancel_matching(self, pred: Callable[[Proposal], bool], reason: str, actor: str = "system") -> list[str]:
         """Annulla le richieste attive per cui ``pred`` e' vera (es. il branch di origine e' cambiato). Ritorna gli id."""

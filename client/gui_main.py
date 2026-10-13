@@ -38,7 +38,7 @@ from client.views.user_mgmt_view import UserMgmtView
 from client.workers import run_async
 from client.ws_listener import WsListener
 from common.roles import Role
-from common.schemas import ProjectOut
+from common.schemas import ProjectOut, ProposalState
 from common.schemas_branches import BranchOut
 
 HEARTBEAT_MS = 30_000
@@ -55,6 +55,11 @@ def _pick_file_dialog(parent: QWidget, title: str, start: str, filters: str) -> 
 
 
 _FILES_LOCK = threading.RLock()      # serializza le scritture su file del client (checkout, auto-sync, reimport)
+
+def _file_sha(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
 
 class MainWindow(QMainWindow):
     def __init__(self, run: Callable = run_async, settings: Optional[QSettings] = None,
@@ -229,7 +234,7 @@ class MainWindow(QMainWindow):
         self.dashboard.lock_release_requested.connect(self.release_lock)
         self.dashboard.lock_force_requested.connect(self.force_release_lock)
         self.dashboard.checkin_requested.connect(self.checkin_master)
-        self.sidebar.branch_changed.connect(self.select_branch)
+        self.sidebar.branch_changed.connect(self.switch_branch)
         self.dashboard.branches_requested.connect(self.show_branches)
         self.dashboard.commit_requested.connect(lambda: self.commit_to_branch())
         self.dashboard.branch_sync_requested.connect(lambda: self.sync_branch())
@@ -834,6 +839,15 @@ class MainWindow(QMainWindow):
         self.sidebar.set_branches(self.branches, cur)
         self._apply_project()
 
+    def switch_branch(self, slug: Optional[str]) -> None:
+        """Cambio di branch voluto dall'utente (selettore, elenco branch): oltre a cambiare contesto scarica subito la testa
+        del branch nella sua cartella locale se li' non c'e' ancora una copia di lavoro (altrimenti la cartella resterebbe vuota
+        fino al primo Checkout)."""
+        self.select_branch(slug)
+        if slug and self.api is not None and self.api.branch == slug and self.project is not None \
+                and self.project.head_revision is not None and self.base_revision == 0:
+            self.checkout()
+
     def select_branch(self, slug: Optional[str]) -> None:
         """Cambia contesto: ``None`` / ``""`` = principale, altrimenti il branch ``slug``. Imposta ``api.branch``,
         chiude le finestre di consenso aperte, ricarica dashboard / cronologia / richieste / lock e riconnette il
@@ -863,7 +877,7 @@ class MainWindow(QMainWindow):
         if api is None or proj is None or proj.head_revision is None:
             return None
         dlg = BranchesDialog(api, proj, self.project_role, api.branch, self._run, self)
-        dlg.switch_requested.connect(self.select_branch)
+        dlg.switch_requested.connect(self.switch_branch)
         dlg.sync_requested.connect(lambda s: self.sync_branch(s))
         dlg.merge_requested.connect(lambda s: self.merge_branch(s))
         dlg.changed.connect(self.load_branches)
@@ -910,9 +924,12 @@ class MainWindow(QMainWindow):
             self.open_proposal(d.id)
         self._run(lambda: api.branch_sync(slug), done, self._err)
 
-    def merge_branch(self, slug: Optional[str] = None, message: Optional[str] = None) -> None:
-        """«Unisci nel principale»: richiesta di merge del branch NEL principale (consenso normale). Dopo l'invio si
-        passa al principale e si apre la proposta. ``message`` salta la domanda (test)."""
+    def merge_branch(self, slug: Optional[str] = None, message: Optional[str] = None, path: Optional[str] = None) -> None:
+        """«Unisci nel principale»: come «Richiedi Merge» si sceglie il file da inviare (di solito il file di lavoro del
+        branch). Se il file e' diverso dalla testa del branch viene prima salvato nel branch (branch personale tuo;
+        in un branch team il file viene inviato direttamente nella richiesta di merge nel principale), poi parte la richiesta di merge del branch
+        NEL principale (consenso normale), si passa al principale e si apre la proposta. ``message`` salta i dialoghi
+        (test); ``path`` e' il file scelto (None = la testa del branch, senza salvare niente)."""
         api = self.api
         slug = slug or (api.branch if api else None)
         if api is None or self.project is None or not slug or self.project_role < Role.DEVELOPER:
@@ -923,25 +940,55 @@ class MainWindow(QMainWindow):
             return
         label = branch_display_name(b, slug)
         if not isinstance(message, str):
-            message, ok_ = QInputDialog.getMultiLineText(
-                self, "Unisci nel principale",
-                f"Il branch «{label}» verrà proposto al principale con una richiesta di merge (consenso normale).\n"
-                "Descrizione delle modifiche (facoltativa):")
-            if not ok_:
+            if api.branch != slug:
+                self.select_branch(slug)                         # i file candidati sono quelli della cartella del branch
+            dlg = MergeRequestDialog(self.local_folder, self.working_file, self.base_revision,
+                                     f"{self.project.name} › {label}", parent=self, ext=self.master_ext,
+                                     kind=self.master_kind, name=self.master_name, title="Unisci nel principale",
+                                     heading_text=f"Quale file vuoi unire nel principale dal branch «{label}»?",
+                                     ok_text="Unisci nel principale")
+            if dlg.exec() != QDialog.Accepted or dlg.selected_path() is None:
                 return
-        message = message.strip()
+            path = str(dlg.selected_path())
+            message = dlg.message_text()
+        message = (message or "").strip()
+        can_commit = b is not None and b.kind == "personal" and abilities(b, self.project_role).commit   # nei team il file va dentro la richiesta
+        ws, name, ext = self.local_folder, self.master_name, self.master_ext
+        base_key = self._base_key()
 
-        def done(d) -> None:
+        def work():
+            saved = None
+            if path:
+                info = api.master_info()                          # testa del branch
+                if _file_sha(Path(path)) != info.sha256:
+                    if not can_commit:                                # branch team: il file viene inviato direttamente nel merge
+                        return None, api.branch_merge(slug, message, Path(path)), "merge"
+                    saved = api.branch_commit(slug, Path(path), message or "Modifiche prima dell'unione nel principale")
+                    try:
+                        with _FILES_LOCK:
+                            api.download_master(ref_path(ws, name, saved.revision, ext), saved.revision)
+                            hide_ref_dir(ws)
+                        api.report_revision(saved.revision)
+                    except Exception:                             # noqa: BLE001 - il salvataggio e' gia' avvenuto
+                        pass
+            return saved, api.branch_merge(slug, message), "merge"
+
+        def done(res) -> None:
+            saved, d, _kind = res
+            if saved is not None:
+                self._log(f"Salvato nel branch «{label}»: nuova rev {saved.revision}")
+                self.settings.setValue(base_key, saved.revision)
+                self.settings.setValue(base_key + "/file", str(path))
             self._log(f"Unione nel principale: richiesta {d.id} per il branch «{label}» "
                       f"({d.n_changes} modifiche, {d.n_conflicts} conflitti)")
             self.select_branch(None)                            # la proposta vive nel principale
             self.refresh_all()
             self.open_proposal(d.id)
-        self._run(lambda: api.branch_merge(slug, message), done, self._err)
+        self._run(work, done, self._err)
 
     def commit_to_branch(self, path: Optional[str] = None, message: Optional[str] = None) -> None:
-        """«Salva su branch...»: salvataggio diretto di una nuova revisione nel TUO branch personale. ``path`` /
-        ``message`` saltano i dialoghi (test). Nei branch team il salvataggio passa da «Richiedi Merge»."""
+        """«Salva su branch...»: salvataggio diretto nel branch: nel TUO branch personale una nuova revisione; in un branch
+        team le tue modifiche si uniscono (3-way) a quelle gia' presenti, senza votazione. ``path`` / ``message`` saltano i dialoghi (test)."""
         api, proj, b = self.api, self.project, self.branch
         if api is None or proj is None or b is None or not abilities(b, self.project_role).commit:
             return
@@ -963,18 +1010,53 @@ class MainWindow(QMainWindow):
         ws, name, ext = self.local_folder, self.master_name, self.master_ext
         base_key = self._base_key()
 
-        def work():
-            m = api.branch_commit(slug, Path(path), message)
-            try:                                                # la copia pulita della nuova testa: base della prossima modifica
+        team = b.kind == "team"
+        base_rev = self.base_revision or None
+
+        def fetch_head(rev: int) -> None:                       # copia pulita della nuova testa del branch (nel .aps)
+            try:
                 with _FILES_LOCK:
-                    api.download_master(ref_path(ws, name, m.revision, ext), m.revision)
+                    api.download_master(ref_path(ws, name, rev, ext), rev)
                     hide_ref_dir(ws)
-                api.report_revision(m.revision)
+                api.report_revision(rev)
             except Exception:                                   # noqa: BLE001 - il salvataggio e' gia' avvenuto
                 pass
+
+        def work():
+            if team:                                            # unione 3-way con quanto gia' nel branch, consenso automatico
+                d = api.branch_save(slug, Path(path), message, base_rev)
+                if d.state == ProposalState.MERGED and d.result_revision is not None:
+                    fetch_head(d.result_revision)
+                return d
+            m = api.branch_commit(slug, Path(path), message)
+            fetch_head(m.revision)
             return m
 
         def done(m) -> None:
+            if team:
+                if m.state != ProposalState.MERGED or m.result_revision is None:
+                    self._log(f"Salvataggio nel branch «{b.name}»: ci sono {m.n_conflicts} conflitti con le modifiche già presenti, da risolvere")
+                    self.refresh_all()
+                    self.open_proposal(m.id)
+                    return
+                rev = m.result_revision
+                self._log(f"Salvato nel branch «{b.name}»: nuova rev {rev}")
+                if self.api is api:
+                    ref = ref_path(ws, name, rev, ext)
+                    same = False
+                    try:
+                        same = ref.exists() and ref.read_bytes() == Path(path).read_bytes()
+                    except OSError:
+                        pass
+                    if same:                                    # nessun altro aveva toccato il branch: il tuo file e' la nuova testa
+                        self.settings.setValue(base_key, rev)
+                        self.settings.setValue(base_key + "/file", str(path))
+                    else:                                       # il branch contiene anche modifiche dei colleghi
+                        self._log("Il branch contiene anche modifiche dei colleghi: fai il Checkout per aggiornare il tuo file")
+                    self._update_local_label()
+                    self._prune_local((path,))
+                    self.refresh_all()
+                return
             self._log(f"Salvato nel branch «{b.name}»: nuova rev {m.revision}")
             if self.api is api:
                 self.settings.setValue(base_key, m.revision)             # il file salvato e' ora la copia di lavoro

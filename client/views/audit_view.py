@@ -19,7 +19,7 @@ from common.schemas import AuditOut, AuditVerifyOut
 ACTIONS = {
     "login": "Accesso", "login_failed": "Accesso fallito", "login_blocked": "Accesso bloccato", "logout": "Uscita",
     "password_changed": "Password cambiata", "token_reuse_detected": "Riuso token rilevato",
-    "session_revoked": "Sessione revocata", "user_created": "Utente creato", "user_updated": "Utente modificato",
+    "session_revoked": "Sessione revocata", "user_created": "Utente creato", "user_updated": "Utente modificato", "user_deleted": "Utente eliminato",
     "project_created": "Progetto creato", "project_updated": "Progetto modificato",
     "master_initialized": "Master inizializzato", "master_downloaded": "Master scaricato",
     "preview_downloaded": "Anteprima scaricata", "merge_requested": "Merge richiesto",
@@ -43,7 +43,7 @@ ACTION_COLORS = {
     "merge_rejected": T["RED"], "login_failed": T["RED"], "login_blocked": T["RED"], "token_reuse_detected": T["RED"],
     "merge_forced": T["ORANGE"], "master_restored": T["ORANGE"], "session_revoked": T["ORANGE"],
     "master_reimported": T["ORANGE"], "revisions_pruned": T["ORANGE"], "retention_changed": T["ORANGE"],
-    "project_deleted": T["RED"], "project_exported": T["ACCENT"], "backup_created": T["ACCENT"],
+    "project_deleted": T["RED"], "user_deleted": T["RED"], "project_exported": T["ACCENT"], "backup_created": T["ACCENT"],
     "lock_forced": T["ORANGE"], "tls_settings_changed": T["ORANGE"], "branch_merged": T["GREEN"], "branch_deleted": T["ORANGE"],
     "revision_locked": T["ACCENT"], "branch_created": T["ACCENT"],
 }

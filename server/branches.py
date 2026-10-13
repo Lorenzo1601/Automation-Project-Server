@@ -386,6 +386,31 @@ def build_router(ctx: Callable[..., Callable], registry, audit: AuditService, cf
             return brt.mgr.master_info()
         return await run_in_threadpool(work)
 
+    @r.post("/{slug}/save", response_model=ProposalDetail, status_code=201)
+    async def save_branch(file: UploadFile = File(...), message: str = Form(""), base_revision: Optional[int] = Form(None),
+                          b=Depends(bctx(Role.DEVELOPER))):
+        """«Salva su branch» in un branch di TEAM: le tue modifiche (rispetto a ``base_revision``, la revisione del branch da cui
+        sei partito; default la testa) vengono unite a quelle gia' nel branch (3-way) e consolidate subito con il solo
+        consenso dell'autore. Se ci sono conflitti la richiesta resta aperta da risolvere."""
+        c, info, brt, dev = b
+        if info.kind != "team":
+            raise HTTPException(422, "«save» vale per i branch di team: in un branch personale si usa il salvataggio diretto")
+        data = await file.read()
+        if len(data) > cfg.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, "File troppo grande")
+        msg = " ".join((message or "").split()) or DEFAULT_COMMIT_MESSAGE
+
+        def work():
+            base = base_revision if base_revision else brt.store.head().revision
+            try:
+                p = brt.mgr.submit(dev, data, base, msg, meta={"kind": "save"}, auto=True)
+            except SessionError as exc:
+                raise HTTPException(exc.status, exc.message) from exc
+            rec(c, "branch_committed", info, proposal=p.id, base_revision=base, size=len(data),
+                filename=(file.filename or "")[:120], message=msg[:200])
+            return brt.mgr.detail(p)
+        return await run_in_threadpool(work)
+
     # ------------------------------------------------------------------ sync dal principale
     @r.post("/{slug}/sync", response_model=ProposalDetail, status_code=201)
     async def sync_branch(b=Depends(bctx(Role.DEVELOPER))):
@@ -417,16 +442,21 @@ def build_router(ctx: Callable[..., Callable], registry, audit: AuditService, cf
 
     # ------------------------------------------------------------------ merge nel principale
     @r.post("/{slug}/merge", response_model=ProposalDetail, status_code=201)
-    async def merge_branch(slug: str, message: str = Form(""), c=Depends(ctx(Role.DEVELOPER, use_branch=False))):
-        """«Unisci nel principale»: richiesta di merge NEL principale (base = principale[base], file = testa del branch)."""
+    async def merge_branch(slug: str, message: str = Form(""), file: Optional[UploadFile] = File(None),
+                           c=Depends(ctx(Role.DEVELOPER, use_branch=False))):
+        """«Unisci nel principale»: richiesta di merge NEL principale (base = principale[base], file = testa del branch,
+        oppure il ``file`` inviato: la versione di lavoro dell'utente, per esempio modificata a partire dal branch)."""
         info = check_write(load(c, slug), c.access.role, c.access.principal.username)
         main, brt = registry.runtime(info.project_id), registry.runtime(info.project_id, slug)
         msg = f"Unione del branch «{info.name}»" + (f": {' '.join(message.split())}" if message.strip() else "")
+        sent = await file.read() if file is not None and file.filename else None
+        if sent is not None and len(sent) > cfg.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, "File troppo grande")
 
         def work():
             with brt.mgr._lock:                                                   # noqa: SLF001
                 head = brt.store.head().revision
-                data = brt.store.read_revision(head)
+                data = sent if sent is not None else brt.store.read_revision(head)
             try:
                 p = main.mgr.submit(c.dev, data, info.base_main_revision, msg,
                                     meta={"kind": "merge", "source_branch": slug, "branch_head": head})

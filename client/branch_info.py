@@ -48,7 +48,7 @@ def display_name(b: Optional[BranchOut], slug: Optional[str] = None) -> str:
 class BranchAbilities:
     """Cosa puo' fare l'utente su un branch (per abilitare i pulsanti)."""
     switch: bool        # «Passa a questo branch»
-    commit: bool        # «Salva su branch...» (solo branch personale)
+    commit: bool        # «Salva su branch...» (personale: revisione diretta; team: unione 3-way con consenso automatico)
     request_merge: bool  # «Richiedi Merge...» dentro il branch (solo branch team)
     sync: bool          # «Aggiorna dal principale»
     merge: bool         # «Unisci nel principale»
@@ -65,7 +65,7 @@ def abilities(b: BranchOut, role: Role, current: Optional[str] = None) -> Branch
     write = dev and is_open and b.can_write
     return BranchAbilities(
         switch=b.slug != current,
-        commit=write and b.kind == "personal",
+        commit=write,
         request_merge=write and b.kind == "team",
         sync=write and b.behind > 0,
         merge=write,

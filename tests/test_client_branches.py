@@ -2,6 +2,7 @@
 
 Due livelli: (1) un server FINTO su ``httpx.MockTransport`` (il vero ``ApiClient`` e la vera ``MainWindow``, nessuna rete);
 (2) in fondo, se il server dei branch c'e', test end-to-end con il server vivo."""
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,7 @@ class FakeServer:
         self.branches: dict[str, BranchOut] = {b.slug: b for b in (branches or [])}
         self.calls: list[tuple[str, str, dict, bytes]] = []
         self.fail_branches: int | None = None
+        self.head_sha = "a" * 64                     # sha256 della testa che il finto server dichiara
 
     # -- utilita'
     def paths(self, method=None, suffix=""):
@@ -69,7 +71,7 @@ class FakeServer:
         return self.branches[branch].head_revision if branch else self.main_head
 
     def _info(self, rev: int) -> dict:
-        return MasterInfo(revision=rev, sha256="a" * 64, updated_at=NOW, updated_by="admin", message=f"rev {rev}",
+        return MasterInfo(revision=rev, sha256=self.head_sha, updated_at=NOW, updated_by="admin", message=f"rev {rev}",
                           kind="l5x", ext=".L5X", name="Master").model_dump(mode="json")
 
     def project(self) -> dict:
@@ -131,6 +133,8 @@ class FakeServer:
             rev = int(q.get("revision") or self._head(branch))
             return httpx.Response(200, content=f"<RSLogix5000Content branch={branch} rev={rev}/>".encode(),
                                   headers={"X-Revision": str(rev)})
+        if path == f"{base}/proposals" and req.method == "POST":
+            return ok(proposal("p-req"))
         if path in (f"{base}/proposals", f"{base}/developers", f"{base}/permissions"):
             return ok([])
         if path == f"{base}/lock":
@@ -191,7 +195,7 @@ def test_branch_rules_by_role_and_state():
     assert not abilities(bo(behind=0), Role.DEVELOPER).sync                                # niente da portare
     assert not abilities(bo(can_write=False, can_delete=False), Role.DEVELOPER).commit     # branch personale altrui
     t = abilities(bo("t", "team"), Role.LEAD)
-    assert t.request_merge and not t.commit and t.merge
+    assert t.request_merge and t.commit and t.merge
     for st in ("merged", "closed"):                                                         # sola lettura
         r = abilities(bo(state=st), Role.DEVELOPER)
         assert not (r.commit or r.sync or r.merge or r.close) and r.switch and r.delete
@@ -528,7 +532,7 @@ def test_dashboard_buttons_follow_branch_kind_role_and_state(qapp, tmp_path, mon
     assert d.btn_branch_sync.isEnabled() and d.btn_branch_merge.isEnabled() and "branch" in d.btn_checkout.text()
     assert d.btn_import.isHidden() and d.btn_reimport.isHidden()                           # il file base e' del principale
     win.select_branch("sq")                                                                # team: normali richieste di merge
-    assert not d.btn_merge.isHidden() and d.btn_merge.isEnabled() and d.btn_commit.isHidden()
+    assert not d.btn_merge.isHidden() and d.btn_merge.isEnabled() and d.btn_commit.isEnabled()
     win.select_branch("altrui")                                                            # personale altrui: sola lettura
     assert not d.btn_commit.isHidden() and not d.btn_commit.isEnabled()
     assert not d.btn_branch_sync.isEnabled() and not d.btn_branch_merge.isEnabled()
@@ -614,11 +618,24 @@ def test_sync_stays_in_branch_and_merge_goes_to_main(qapp, tmp_path, monkeypatch
     assert "Aggiornamento dal principale" in win.dashboard.log.toPlainText()
 
     win.opened.clear()
-    msgs = []
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *a, **k: (msgs.append(a[2]), ("unisco tutto", True))[1])
+    ws = win.local_folder
+    ws.mkdir(parents=True, exist_ok=True)
+    f = ws / "Master_rev3.L5X"
+    f.write_bytes(b"identico alla testa")
+    srv.head_sha = hashlib.sha256(b"identico alla testa").hexdigest()                      # il file scelto = testa del branch: niente commit
+    seen = {}
+
+    def fake_exec(self):
+        seen["title"], seen["ok"] = self.windowTitle(), self.ok_btn.text()
+        self.select_path(f)
+        self.message.setText("unisco tutto")
+        return QDialog.Accepted
+    monkeypatch.setattr(MergeRequestDialog, "exec", fake_exec)
     win.dashboard.btn_branch_merge.click()                                                 # banner: «Unisci nel principale...»
     post = srv.last("POST", "/merge")
-    assert post[1].endswith("/branches/mio/merge") and b"message=unisco+tutto" in post[3] and "mio" in msgs[0]
+    assert seen == {"title": "Unisci nel principale", "ok": "Unisci nel principale"}       # la stessa finestra di «Richiedi Merge»
+    assert not srv.paths("POST", "/commit")
+    assert post[1].endswith("/branches/mio/merge") and b"message=unisco+tutto" in post[3]
     assert win.api.branch is None and win.opened == [("p-merge", None)]                     # passa al principale e apre la proposta
     assert win.ws.urls[-1].endswith("&project=1") and win.dashboard.branch_bar.isHidden()
 
@@ -631,7 +648,7 @@ def test_sync_stays_in_branch_and_merge_goes_to_main(qapp, tmp_path, monkeypatch
     win.sync_branch("pari")
     assert len(srv.paths("POST", "/sync")) == n
     # annullare la domanda sul messaggio non invia nulla
-    monkeypatch.setattr(QInputDialog, "getMultiLineText", lambda *a, **k: ("", False))
+    monkeypatch.setattr(MergeRequestDialog, "exec", lambda self: QDialog.Rejected)
     k = len(srv.paths("POST", "/merge"))
     win.merge_branch("mio")
     assert len(srv.paths("POST", "/merge")) == k
@@ -684,6 +701,54 @@ def test_new_branch_creates_local_folder_with_export(qapp, tmp_path, monkeypatch
     assert win.api.branch == "prova" and win.local_folder == ws
     assert ws.is_dir() and list(ws.glob("Master_rev*.L5X")) and list((ws / ".aps").glob("Master_rev*.L5X"))
     assert win.working_file and Path(win.working_file).parent == ws
+    win.close()
+
+
+def test_merge_into_main_saves_modified_file_first(qapp, tmp_path, monkeypatch):
+    """Il file scelto nella finestra e' diverso dalla testa: nel branch personale viene prima salvato, poi si unisce;
+    nel branch team non si salva (si usa «Richiedi Merge») e non parte nessuna unione."""
+    srv = FakeServer(branches=[bo("mio", head=2), bo("sq", "team", owner="lead", bid=2)])
+    win = make_window(tmp_path, monkeypatch, srv)
+    win.select_branch("mio")
+    ws = win.local_folder
+    ws.mkdir(parents=True, exist_ok=True)
+    f = ws / "mie_modifiche.L5X"
+    f.write_text("<RSLogix5000Content>nuove</RSLogix5000Content>", "utf-8")
+    monkeypatch.setattr(MergeRequestDialog, "exec", lambda self: (self.select_path(f), self.message.setText("pronto"), QDialog.Accepted)[2])
+    win.merge_branch("mio")
+    assert [c[1] for c in srv.calls if c[0] == "POST" and c[1].endswith(("/commit", "/merge"))][-2:] == \
+        ["/api/projects/1/branches/mio/commit", "/api/projects/1/branches/mio/merge"]
+    assert b"nuove</RSLogix5000Content>" in srv.last("POST", "/commit")[3] and win.opened[-1] == ("p-merge", None)
+    assert srv.branches["mio"].head_revision == 3
+
+    n = len(srv.paths("POST", "/merge"))
+    sq = win.project_folder / BRANCHES_DIR / "sq"
+    sq.mkdir(parents=True, exist_ok=True)
+    g = sq / "mie_modifiche.L5X"
+    g.write_text("<RSLogix5000Content>team</RSLogix5000Content>", "utf-8")
+    monkeypatch.setattr(MergeRequestDialog, "exec", lambda self: (self.select_path(g), self.message.setText("x"), QDialog.Accepted)[2])
+    win.opened.clear()
+    win.merge_branch("sq")                                                                  # branch team: il file va dentro la richiesta di unione
+    assert len(srv.paths("POST", "/merge")) == n + 1 and not srv.paths("POST", "/commit")[1:]
+    post = srv.last("POST", "/merge")
+    assert post[1] == "/api/projects/1/branches/sq/merge" and b"team</RSLogix5000Content>" in post[3] and b"message" in post[3]
+    assert win.api.branch is None and win.opened[-1] == ("p-merge", None)                   # richiesta nel PRINCIPALE
+    win.close()
+
+
+def test_switching_to_branch_downloads_its_head_when_folder_is_empty(qapp, tmp_path, monkeypatch):
+    """Regressione: un altro utente passa a un branch: la cartella locale non resta vuota, contiene l'ultimo export."""
+    srv = FakeServer(branches=[bo("mio", head=4, can_write=False, owner="altro")])
+    win = make_window(tmp_path, monkeypatch, srv)
+    win.sidebar.branch_changed.emit("mio")                                               # selettore della barra laterale
+    ws = tmp_path / "proj" / "branches" / "mio"
+    assert win.api.branch == "mio" and win.base_revision == 4
+    assert (ws / "Master_rev4.L5X").exists() and (ws / ".aps" / "Master_rev4.L5X").exists()
+    assert b"branch=mio" in (ws / "Master_rev4.L5X").read_bytes()
+    n = len(srv.paths("GET", "/master/download"))
+    win.switch_branch(None)
+    win.switch_branch("mio")                                                              # ha gia' una copia: nessun nuovo scarico
+    assert len(srv.paths("GET", "/master/download")) == n
     win.close()
 
 
@@ -883,6 +948,10 @@ def test_live_personal_branch_full_cycle(blive, qapp, tmp_path, monkeypatch):
     if d.state != ProposalState.MERGED:
         adm.force_merge(prop_id, "chiusura del test end-to-end")
     assert next(x for x in adm.branches() if x.slug == "prova-live").state == "merged"
+    out = tmp_path / "main_dopo_unione.txt"
+    adm.download_master(out)                                                           # il principale contiene entrambe le modifiche
+    got = out.read_text("utf-8")
+    assert "riga 3 DEL BRANCH" in got and "riga 8 DAL PRINCIPALE" in got, got
     win.load_branches()
     assert next(x for x in win.branches if x.slug == "prova-live").state == "merged"
     assert win.sidebar.branch.count() == 1                                              # unito: non piu' nel selettore
@@ -924,7 +993,7 @@ def test_live_viewer_is_read_only_and_team_branch_uses_normal_requests(blive, qa
     win = _lwin(live, tmp_path, "dev2")
     win.select_branch("squadra-live")
     d = win.dashboard
-    assert not d.btn_merge.isHidden() and d.btn_merge.isEnabled() and d.btn_commit.isHidden()
+    assert not d.btn_merge.isHidden() and d.btn_merge.isEnabled() and not d.btn_commit.isHidden()
     win.checkout()
     assert win.local_folder.parent.name == BRANCHES_DIR and win.base_revision >= 1
     f = Path(win.working_file)
@@ -937,6 +1006,21 @@ def test_live_viewer_is_read_only_and_team_branch_uses_normal_requests(blive, qa
     assert [p.id for p in win.dashboard.visible_proposals()] == [in_branch[0].id]
     win.select_branch(None)                                                            # sul principale non c'e'
     assert not [p for p in win.dashboard.visible_proposals() if p.message == "modifica di squadra"]
+
+    # --- «Salva su branch» anche nel team: unione 3-way con quanto gia' nel branch, senza votazione
+    warned_live = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned_live.append(a[2]))
+    win.select_branch("squadra-live")
+    win.commit_to_branch(str(f), "salvo nel branch di squadra")
+    assert not warned_live, warned_live
+    team_api = _lapi(live, "dev2", "squadra-live")
+    head = team_api.master_info().revision
+    assert head >= 2
+    out = tmp_path / "head_squadra.txt"
+    team_api.download_master(out)
+    assert "riga 5 TEAM" in out.read_text("utf-8")                                      # un collega che fa il Checkout la trova
+    assert next(x for x in team_api.branches() if x.slug == "squadra-live").head_revision == head
+    assert win.base_revision == head                                                   # nessun altro aveva toccato: il file e' la nuova testa
     win.ws.stop()
     win.close()
 

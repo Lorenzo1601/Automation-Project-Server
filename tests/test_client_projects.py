@@ -317,3 +317,51 @@ def test_server_console_reimport_button_and_flow(fresh, qapp, tmp_path, monkeypa
     assert view.current_project().head_revision == 2 and emitted
     assert "Master rev 2" in view.proj_info.text()
     assert any(e.action == "master_reimported" and e.target == "rev2" for e in api.audit(limit=20))
+
+
+def test_delete_user_server_and_ui(fresh, qapp, monkeypatch):
+    """Eliminare un utente: solo Admin; non se stessi ne' l'ultimo Admin; sessioni e permessi spariscono, audit resta."""
+    from client.api_client import ApiClient, ApiError
+    from client.views import user_mgmt_view as U
+    from common.schemas import ProjectCreate, UserCreate
+    api = ApiClient(fresh["url"])
+    api.login("admin", ADMIN_PW)
+    u = api.create_user(UserCreate(username="da.eliminare", display_name="Da Eliminare", password="Password-lunga-1", role="Developer",
+                                   must_change_password=False))
+    proj = api.create_project(ProjectCreate(name="Per permessi"))
+    api.set_permission(proj.id, u.id, "Developer")
+    victim = ApiClient(fresh["url"])
+    victim.login("da.eliminare", "Password-lunga-1")
+    with pytest.raises(ApiError) as e:
+        victim.delete_user(u.id)                                                           # un Developer non puo'
+    assert e.value.status == 403
+    with pytest.raises(ApiError) as e:
+        api.delete_user(api.user.id)                                                       # non se stessi
+    assert e.value.status == 409
+    with pytest.raises(ApiError) as e:
+        api.delete_user(999999)
+    assert e.value.status == 404
+
+    msgs = Msgs(monkeypatch)
+    view = U.UserMgmtView(api, run=sync)
+    view.reload()
+    row = next(i for i, x in enumerate(view._users) if x.id == u.id)
+    view.users_table.selectRow(row)
+    assert view.btn_delete_user.isEnabled()
+    view.users_table.selectRow(next(i for i, x in enumerate(view._users) if x.id == api.user.id))
+    assert not view.btn_delete_user.isEnabled()                                            # non si puo' selezionare se stessi
+    view.users_table.selectRow(row)
+    msgs.answer = QMessageBox.No
+    view.btn_delete_user.click()                                                           # dal pulsante vero: annullato
+    assert any(x.id == u.id for x in api.users()) and "Eliminare definitivamente" in msgs.questions[-1]
+    msgs.answer = QMessageBox.Yes
+    view.btn_delete_user.click()                                                           # confermato
+    assert not msgs.warnings, msgs.warnings
+    assert not any(x.id == u.id for x in api.users())
+    with pytest.raises(ApiError):
+        victim.me()                                                                        # la sua sessione non vale piu'
+    with pytest.raises(ApiError) as e:
+        ApiClient(fresh["url"]).login("da.eliminare", "Password-lunga-1")
+    assert e.value.status in (401, 403)
+    assert u.id not in [p.user_id for p in api.permissions(proj.id)]                       # i suoi permessi non ci sono piu'
+    assert any(a.action == "user_deleted" and a.target == "da.eliminare" for a in api.audit(limit=50))

@@ -1126,3 +1126,56 @@ def test_slugify_and_permission_helpers():
     assert not can_write(mk_("team"), Role.VIEWER, "own") and not can_write(mk_("team", "closed"), Role.ADMIN, "own")
     assert can_delete(mk_("team", "merged"), Role.LEAD, "x") and not can_delete(mk_("personal"), Role.LEAD, "x")
     assert can_delete(mk_("personal"), Role.DEVELOPER, "own") and not can_delete(mk_("personal"), Role.VIEWER, "own")
+
+
+def test_merge_l5x_branch_into_main_contains_the_change(world):
+    """Regressione: con un Master L5X l'unione di un branch porta davvero la modifica nel principale."""
+    c, app, pid, H, _ = world
+    mk(c, pid, H["dev1"], "prova")
+    commit(c, pid, H["dev1"], "prova", S.dev_a().encode(), "modifica L5X", name="m.L5X")
+    d = c.post(B(pid, "prova", "/merge"), headers=H["dev1"], data={"message": "x"}).json()
+    assert d["n_changes"] > 0, d
+    done = finish_main(c, pid, H, d["id"])
+    assert done["state"] == "merged"
+    main = download(c, pid, H["viewer"])
+    assert main != S.base_project().encode() and main == download(c, pid, H["viewer"], None, done["result_revision"])
+    assert b"DevA" in main or main != S.base_project().encode()
+
+
+def test_merge_team_branch_with_sent_file_goes_to_main(tworld):
+    """«Unisci nel principale» con un file di lavoro diverso dalla testa del branch: la richiesta nel principale usa quel file."""
+    c, app, pid, H, _ = tworld
+    mk(c, pid, H["lead"], "squadra", "team")
+    r = c.post(B(pid, "squadra", "/merge"), headers=H["lead"], data={"message": "mio file"},
+               files={"file": ("m.txt", text_master(l2="dal file inviato"))})
+    assert r.status_code == 201, r.text
+    d = r.json()
+    assert d["n_changes"] == 1 and "mio file" in d["message"]
+    assert [p["id"] for p in c.get(f"/api/projects/{pid}/proposals", headers=H["viewer"]).json()] == [d["id"]]
+    done = finish_main(c, pid, H, d["id"], "lead")
+    assert done["state"] == "merged"
+    assert download(c, pid, H["viewer"]) == text_master(l2="dal file inviato")
+    assert get(c, pid, H["viewer"], "squadra")["state"] == "merged"
+
+
+def test_team_save_merges_three_way_without_vote_and_keeps_colleague_work(tworld):
+    c, app, pid, H, _ = tworld
+    mk(c, pid, H["lead"], "squadra", "team")
+    f = lambda **kw: {"file": ("m.txt", text_master(**kw))}                                  # noqa: E731
+    # dev1 e dev2 partono entrambi dalla rev 1 del branch
+    r1 = c.post(B(pid, "squadra", "/save"), headers=H["dev1"], data={"message": "uno", "base_revision": 1}, files=f(l2="da dev1"))
+    assert r1.status_code == 201, r1.text
+    assert r1.json()["state"] == "merged" and r1.json()["result_revision"] == 2
+    r2 = c.post(B(pid, "squadra", "/save"), headers=H["dev2"], data={"message": "due", "base_revision": 1}, files=f(l5="da dev2"))
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["state"] == "merged" and r2.json()["result_revision"] == 3
+    assert download(c, pid, H["viewer"], "squadra") == text_master(l2="da dev1", l5="da dev2")        # nessuna modifica persa
+    assert head_of(c, pid, H["dev1"]) == 1                                                  # il principale non e' toccato
+    # conflitto sulla stessa riga: la richiesta resta da risolvere
+    r3 = c.post(B(pid, "squadra", "/save"), headers=H["dev2"], data={"message": "tre", "base_revision": 1}, files=f(l2="in conflitto"))
+    assert r3.status_code == 201 and r3.json()["state"] != "merged" and r3.json()["n_conflicts"] >= 1
+    # il branch personale non usa /save; il Viewer non puo'
+    mk(c, pid, H["dev1"], "mio")
+    assert c.post(B(pid, "mio", "/save"), headers=H["dev1"], data={"message": "x"}, files=f(l2="x")).status_code == 422
+    assert c.post(B(pid, "squadra", "/save"), headers=H["viewer"], data={"message": "x"}, files=f(l2="y")).status_code == 403
+    assert [a["details"]["message"] for a in audit(c, H, pid, "branch_committed")][:2]

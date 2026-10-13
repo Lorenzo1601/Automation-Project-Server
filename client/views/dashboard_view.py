@@ -431,10 +431,12 @@ class DashboardView(QWidget):
         self.btn_merge.setToolTip("" if not slug else
                                   "Branch di sola lettura" if not (ab and ab.request_merge) else
                                   "Invia le modifiche al branch (richiesta di merge con consenso)")
-        self.btn_commit.setVisible(bool(dev and b is not None and b.kind == "personal"))
+        self.btn_commit.setVisible(bool(dev and b is not None))
         self.btn_commit.setEnabled(bool(ab and ab.commit))
-        self.btn_commit.setToolTip("Salva direttamente una nuova revisione nel tuo branch personale" if (ab and ab.commit)
-                                   else "Solo il proprietario scrive nel branch personale, finché è aperto")
+        self.btn_commit.setToolTip(
+            ("Salva direttamente una nuova revisione nel tuo branch personale" if b is not None and b.kind == "personal" else
+             "Salva nel branch di team: le tue modifiche si uniscono a quelle già presenti, senza votazione") if (ab and ab.commit)
+            else "Branch di sola lettura per te (personale altrui, chiuso o unito)")
         if slug:
             self.btn_checkout.setText("  Checkout testa del branch" if dev else "  Scarica testa del branch")
         else:

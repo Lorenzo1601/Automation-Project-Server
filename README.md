@@ -344,12 +344,14 @@ nuova ricordati di documentarla in `client/views/help_view.py` e, se genera un e
   Per un servizio Windows già installato, cambiare le impostazioni TLS richiede di reinstallarlo. Audit: `tls_certificate_generated`, `tls_settings_changed`. Richiede `cryptography`.
 * **PLCopen XML (CODESYS)**: merge strutturale (vedi tabella dei tipi). Il progetto deve avere lo stesso `contentHeader@name`; DOCTYPE/entità esterne sono rifiutati.
 * **Branch**: linee alternative del Master dentro un progetto, con revisioni, presa in carico, richieste di merge e commenti propri
-  (`data/projects/<progetto>/branches/<branch>/`). *Team* (Lead/Admin): richieste di merge e consenso normali. *Personale* (Developer o superiore, max 5 aperti
+  (`data/projects/<progetto>/branches/<branch>/`). *Team* (Lead/Admin): scrivono tutti i Developer; «Salva su branch» (`POST .../branches/{slug}/save`) unisce 3-way le modifiche con quelle già nel branch e consolida subito col solo consenso dell'autore (conflitti: la richiesta resta da risolvere); «Richiedi Merge» resta per chiedere il consenso. *Personale* (Developer o superiore, max 5 aperti
   per utente e progetto): scrive solo il proprietario con salvataggi diretti (`POST .../branches/{slug}/commit`); le richieste nel branch hanno il solo consenso dell'autore.
   «Aggiorna dal principale» (`/sync`) porta nel branch le novità con un 3-way; «Unisci nel principale» (`/merge`) crea una richiesta nel principale con consenso normale e a
   merge fatto il branch diventa `merged` (sola lettura, come `closed`). Le basi dei branch aperti non sono eliminate dal limite di revisioni. Tutte le chiamate di progetto accettano `?branch=<slug>`, anche il WebSocket;
   gli eventi portano `branch`. Export e backup includono i branch; eliminando il progetto spariscono anche i branch. Nel client: selettore nella barra laterale,
   banner del branch, «Branch...», «Salva su branch...», cartelle locali `<cartella>/branches/<nome>/`. Audit: `branch_created/synced/merged/closed/deleted/committed`.
+
+* **Eliminazione utenti** (solo Admin, `DELETE /api/users/{id}`, pulsante «Elimina utente...» in Utenti & Permessi del client e della console del server): sessioni e permessi di progetto vengono rimossi; audit, commenti e branch restano col nome; non si elimina se stessi né l'ultimo Admin attivo. Audit: `user_deleted`.
 
 ## Sicurezza e audit
 

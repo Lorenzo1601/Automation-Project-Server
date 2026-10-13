@@ -269,6 +269,28 @@ class AuthService:
         self.audit.record("user_updated", actor.username, target=uname, ip=actor.ip, details=changed)
         return out
 
+    def delete_user(self, actor: Principal, uid: int) -> None:
+        """Elimina definitivamente un utente (solo Admin): sessioni e permessi di progetto spariscono con lui. Non si puo'
+        eliminare se stessi ne' l'ultimo amministratore attivo. Cronologia eventi, commenti e branch gia' creati restano
+        (portano solo il nome utente); l'azione e' registrata come ``user_deleted``."""
+        with self.db.scope() as s:
+            u = s.get(User, uid)
+            if not u:
+                raise AuthError(404, "Utente inesistente")
+            if u.id == actor.user_id:
+                raise AuthError(409, "Non puoi eliminare te stesso")
+            admins = s.scalar(select(func.count(User.id)).join(RoleRow, RoleRow.id == User.role_id)
+                              .where(RoleRow.rank == int(Role.ADMIN), User.is_active.is_(True)))
+            if u.role.rank == int(Role.ADMIN) and u.is_active and admins <= 1:
+                raise AuthError(409, "Non si puo' eliminare l'ultimo amministratore attivo")
+            name, role = u.username, Role(u.role.rank).key
+            n_perm = len(u.permissions)
+            for sess in list(s.scalars(select(AuthSession).where(AuthSession.user_id == u.id))):
+                s.delete(sess)
+            s.delete(u)                                           # i permessi di progetto vanno via in cascata
+        self.audit.record("user_deleted", actor.username, target=name, ip=actor.ip,
+                          details={"role": role, "permissions_removed": n_perm})
+
     def change_password(self, p: Principal, old: str, new: str) -> None:
         try:
             validate_password_policy(new)

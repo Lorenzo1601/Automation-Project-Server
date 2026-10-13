@@ -202,7 +202,10 @@ class UserMgmtView(QWidget):
         self.btn_edit = QPushButton("Modifica...")
         self.btn_toggle = QPushButton("Disattiva")
         self.btn_toggle.setProperty("variant", "danger")
-        for b in (self.btn_new, self.btn_edit, self.btn_toggle):
+        self.btn_delete_user = QPushButton("Elimina utente...")
+        self.btn_delete_user.setProperty("variant", "danger")
+        self.btn_delete_user.setToolTip("Elimina definitivamente l'utente (solo Admin). Non puoi eliminare te stesso né l'ultimo amministratore")
+        for b in (self.btn_new, self.btn_edit, self.btn_toggle, self.btn_delete_user):
             bar.addWidget(b)
         bar.addStretch(1)
         l.addLayout(bar)
@@ -217,6 +220,7 @@ class UserMgmtView(QWidget):
         self.btn_new.clicked.connect(self.new_user)
         self.btn_edit.clicked.connect(self.edit_user)
         self.btn_toggle.clicked.connect(self.toggle_user)
+        self.btn_delete_user.clicked.connect(lambda _c=False: self.delete_user())
         self.users_table.cellDoubleClicked.connect(lambda *_: self.edit_user())
         self.users_table.itemSelectionChanged.connect(self._sel_changed)
 
@@ -244,6 +248,7 @@ class UserMgmtView(QWidget):
         u = self._selected_user()
         self.btn_edit.setEnabled(u is not None)
         self.btn_toggle.setEnabled(u is not None and u.id != self.api.user.id)
+        self.btn_delete_user.setEnabled(u is not None and u.id != self.api.user.id)
         self.btn_toggle.setText("Riattiva" if (u and not u.is_active) else "Disattiva")
         self.btn_toggle.setProperty("variant", "success" if (u and not u.is_active) else "danger")
         self.btn_toggle.style().unpolish(self.btn_toggle)
@@ -279,6 +284,22 @@ class UserMgmtView(QWidget):
             return
         self._run(lambda: self.api.update_user(u.id, UserUpdate(is_active=target)),
                   lambda _x: self.reload(), self._err)
+
+    def delete_user(self, confirm: Optional[bool] = None) -> None:
+        """Elimina definitivamente l'utente selezionato (solo Admin). ``confirm`` salta la domanda (test)."""
+        u = self._selected_user()
+        if u is None or u.id == self.api.user.id:
+            return
+        if confirm is None:
+            confirm = QMessageBox.question(
+                self, "Elimina utente",
+                f"Eliminare definitivamente l'utente «{u.username}»?\n\nLe sue sessioni e i suoi permessi di progetto vengono rimossi. "
+                "La cronologia eventi, i commenti e i branch che ha creato restano (con il suo nome). "
+                "Per sospendere l'accesso senza cancellare usa «Disattiva».") == QMessageBox.Yes
+        if not confirm:
+            return
+        self._run(lambda: self.api.delete_user(u.id),
+                  lambda _x: (self.status.emit(f"Utente {u.username} eliminato"), self.reload()), self._err)
 
     # ------------------------------------------------------------------ tab permessi
     def _build_perm_tab(self) -> None:
