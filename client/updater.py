@@ -28,11 +28,12 @@ def check(api: ApiClient, current: str = APP_VERSION) -> UpdateInfo:
     return api.client_update(current)
 
 
-def download(api: ApiClient, info: UpdateInfo, dest_dir: Optional[Path] = None) -> Path:
+def download(api: ApiClient, info: UpdateInfo, dest_dir: Optional[Path] = None,
+             progress: Optional[Callable[[int, int], None]] = None) -> Path:
     """Scarica il nuovo client in una cartella temporanea e ne verifica lo SHA-256 dichiarato dal server."""
     dest_dir = Path(dest_dir or tempfile.mkdtemp(prefix="aps_update_"))
     dest = dest_dir / (info.filename or "AutomationProjectClient.exe")
-    api.download_client(dest)
+    api.download_client(dest, progress)
     got = hashlib.sha256(dest.read_bytes()).hexdigest()
     if info.sha256 and got != info.sha256:
         dest.unlink(missing_ok=True)
@@ -40,19 +41,41 @@ def download(api: ApiClient, info: UpdateInfo, dest_dir: Optional[Path] = None) 
     return dest
 
 
-def replace_script(new_exe: Path, target: Path, pid: Optional[int] = None) -> str:
-    """Testo dello script .bat che attende la chiusura dell'app, sostituisce l'eseguibile e lo riavvia."""
+def replace_script(new_exe: Path, target: Path, pid: Optional[int] = None, log: Optional[Path] = None) -> str:
+    """Testo dello script .bat: attende la chiusura dell'app (se non si chiude entro ~40 s la termina), sostituisce
+    l'eseguibile e lo riavvia con un ambiente PyInstaller «pulito». Scrive un log (``aps_client_update.log`` in %TEMP%)."""
     pid = pid if pid is not None else os.getpid()
+    log = log or Path(tempfile.gettempdir()) / "aps_client_update.log"
     return "\r\n".join([
         "@echo off",
         f'rem Aggiornamento Automation Project Client -> {target.name}',
+        f'set LOG="{log}"',
+        'echo %date% %time% avvio aggiornamento > %LOG%',
+        "set PYINSTALLER_RESET_ENVIRONMENT=1",
+        "set _MEIPASS2=",
+        "set waits=0",
         ":wait",
         f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul',
-        "if not errorlevel 1 (ping 127.0.0.1 -n 2 >nul & goto wait)",
+        "if errorlevel 1 goto moved0",
+        "set /a waits+=1",
+        "if %waits% GEQ 20 (",
+        f'  echo il client non si chiude: lo termino >> %LOG%',
+        f'  taskkill /F /PID {pid} >nul 2>&1',
+        "  ping 127.0.0.1 -n 3 >nul",
+        "  goto moved0",
+        ")",
+        "ping 127.0.0.1 -n 3 >nul & goto wait",
+        ":moved0",
         "set tries=0",
         ":move",
-        f'move /Y "{new_exe}" "{target}" >nul 2>&1',
-        "if errorlevel 1 (set /a tries+=1 & if %tries% LSS 30 (ping 127.0.0.1 -n 2 >nul & goto move))",
+        f'move /Y "{new_exe}" "{target}" >> %LOG% 2>&1',
+        "if errorlevel 1 (",
+        "  set /a tries+=1",
+        "  if %tries% LSS 30 (ping 127.0.0.1 -n 2 >nul & goto move)",
+        "  echo sostituzione fallita >> %LOG%",
+        "  exit /b 1",
+        ")",
+        'echo sostituito, riavvio >> %LOG%',
         f'start "" "{target}"',
         'del "%~f0"', ""])
 

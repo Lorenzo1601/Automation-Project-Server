@@ -5,11 +5,12 @@ progetto usano ``self.project_id`` (impostato dalla GUI con ``set_project``).
 """
 from __future__ import annotations
 
+import os
 import ssl
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
@@ -229,9 +230,37 @@ class ApiClient:
     def client_update(self, current: str = "") -> UpdateInfo:
         return UpdateInfo(**self._req("GET", "/api/client/update", params={"current": current}).json())
 
-    def download_client(self, dest: Path) -> None:
+    def download_client(self, dest: Path, progress: Optional[Callable[[int, int], None]] = None) -> None:
+        """Scarica l'eseguibile pubblicato in streaming (senza tenerlo tutto in memoria, senza limite di tempo totale)."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(self._req("GET", "/api/client/download").content)
+        if self.tokens and time.monotonic() >= self._expires_at - 30:
+            self._refresh()
+        headers = {"Authorization": f"Bearer {self.tokens.access_token}"} if self.tokens else {}
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            with self._http.stream("GET", "/api/client/download", headers=headers,
+                                   timeout=httpx.Timeout(60.0, read=300.0)) as r:
+                if r.status_code >= 400:
+                    r.read()
+                    try:
+                        detail = r.json().get("detail", r.text)
+                    except Exception:
+                        detail = r.text
+                    raise ApiError(r.status_code, str(detail))
+                total, got = int(r.headers.get("content-length") or 0), 0
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_bytes(1 << 20):
+                        f.write(chunk)
+                        got += len(chunk)
+                        if progress:
+                            progress(got, total)
+            if total and got != total:
+                raise ApiError(0, f"Download incompleto ({got} di {total} byte)")
+            os.replace(tmp, dest)
+        except httpx.HTTPError as exc:
+            raise self._transport_error(exc) from exc
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def publish_client(self, file: Path, version: str, notes: str = "") -> UpdateInfo:
         with open(file, "rb") as f:

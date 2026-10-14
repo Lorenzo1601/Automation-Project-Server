@@ -54,7 +54,7 @@ def test_updater_download_verifies_hash_and_script(tmp_path, monkeypatch):
         def __init__(self, data):
             self.data = data
 
-        def download_client(self, dest):
+        def download_client(self, dest, progress=None):
             Path(dest).write_bytes(self.data)
 
     info = UpdateInfo(available=True, version="2.1", sha256=hashlib.sha256(EXE).hexdigest(), filename="Client.exe")

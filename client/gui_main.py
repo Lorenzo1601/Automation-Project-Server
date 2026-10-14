@@ -1,6 +1,7 @@
 """Finestra principale del Automation Project Client: login -> workspace (sidebar + dashboard / cronologia / utenti)."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -1318,20 +1319,45 @@ class MainWindow(QMainWindow):
         if api is None:
             return
         self._log(f"Scarico il client {info.version}...")
+        self.statusBar().showMessage(f"Scarico l'aggiornamento {info.version}...", 0)
+        last = [0]
+
+        def progress(got: int, total: int) -> None:                 # dal thread di lavoro: solo un contatore, la GUI lo legge
+            last[0] = got
+
+        timer = QTimer(self)
+        timer.setInterval(500)
+        timer.timeout.connect(lambda: self.statusBar().showMessage(
+            f"Scarico l'aggiornamento {info.version}: {last[0] / 1048576:.1f} MB"
+            + (f" di {info.size / 1048576:.1f} MB" if info.size else ""), 0))
+        timer.start()
 
         def work():
-            return updater.download(api, info)
+            return updater.download(api, info, progress=progress)
+
+        def fail(exc: Exception) -> None:
+            timer.stop()
+            self.statusBar().clearMessage()
+            self._err(exc)
 
         def done(path) -> None:
+            timer.stop()
+            self.statusBar().showMessage("Aggiornamento scaricato: riavvio...", 0)
             try:
                 updater.apply(path)
-            except updater.UpdateError as exc:
+            except (updater.UpdateError, OSError) as exc:
                 QMessageBox.warning(self, "Aggiornamento non riuscito", str(exc))
                 return
             self._log("Aggiornamento pronto: riavvio dell'applicazione")
             if quit_app:
+                try:
+                    self._hb.stop()
+                    self.ws.stop()
+                except Exception:                                   # noqa: BLE001
+                    pass
                 QApplication.quit()
-        self._run(work, done, self._err)
+                QTimer.singleShot(3000, lambda: os._exit(0))        # se un thread residuo tiene vivo il processo, lo script attenderebbe
+        self._run(work, done, fail)
 
     # ----------------------------------------------------------------- notifiche (posta in arrivo)
     def refresh_unread(self) -> None:

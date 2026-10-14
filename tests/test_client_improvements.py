@@ -184,6 +184,12 @@ def test_live_client_update_offer_download_and_apply(blive, qapp, tmp_path, monk
     assert questions and "9.9" in questions[0] and "Nuove funzioni" in questions[0]
     assert launched and launched[0].read_bytes() == data
     assert hashlib.sha256(launched[0].read_bytes()).hexdigest() == win.update_info.sha256 and not warns
+    # install_update vero (streaming + SHA-256 + apply) senza chiudere l'app
+    monkeypatch.undo()
+    monkeypatch.setattr(updater, "apply", lambda p, **k: launched.append(Path(p)) or Path(p))
+    launched.clear()
+    win.install_update(win.update_info, quit_app=False)
+    assert pump(qapp, lambda: bool(launched)) and launched[0].read_bytes() == data and not launched[0].name.endswith(".part")
     # chi e' gia' aggiornato non vede nulla
     assert _lapi(live, "dev1").client_update("9.9").available is False
     win.ws.stop()
